@@ -925,10 +925,11 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   # While the primary is limited, run on the fallback harness from the start. The window
   # expires on its own; primary_is_limited clears the marker once the clock passes it, so
   # reverting needs no timer and no separate job.
-  local turn_harness="$AGENT_HARNESS" turn_model="$AGENT_MODEL" turn_sid="$sid"
+  local turn_harness="$AGENT_HARNESS" turn_model="$AGENT_MODEL" turn_sid="$sid" on_fallback=0
   if [ -n "${AGENT_FALLBACK_HARNESS:-}" ] && primary_is_limited; then
     turn_harness="$AGENT_FALLBACK_HARNESS"; turn_model="${AGENT_FALLBACK_MODEL:-$AGENT_MODEL}"
     turn_sid=""   # the fallback cannot resume the primary's session
+    on_fallback=1
     echo "[$AGENT_NAME worker-$$] primary limited until $(cat "$LIMITED" 2>/dev/null); using $turn_harness"
   fi
 
@@ -1012,7 +1013,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
       ( sleep "$MODEL_TIMEOUT"; kill -TERM "$gpid" 2>/dev/null; sleep 3; kill -KILL "$gpid" 2>/dev/null ) & tpid=$!
       wait "$gpid" 2>/dev/null; kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
       reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
-      new_sid=""   # do not overwrite the primary's session id with the fallback's
+      new_sid=""; on_fallback=1   # do not overwrite the primary's session id with the fallback's
       cost_data="$(extract_harness_field "$turn_harness" "$out_file" cost)"
     fi
   fi
@@ -1021,7 +1022,11 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   { [ -z "$reply" ] || [ "$reply" = "null" ]; } && ppq_output_is_402 "$out_file" && ppq_outage=1
   rm -f "$out_file"
 
-  [ -n "$new_sid" ] && set_session "$root_id" "$new_sid"
+  # A fallback session id is unusable by the primary: once the limit window expires the
+  # primary resumes an id it has never heard of, every turn dies instantly with "No
+  # conversation found", and the thread goes silent (2026-09-02). The fallback always
+  # runs with turn_sid="" anyway, so there is nothing to keep.
+  [ -n "$new_sid" ] && [ "$on_fallback" = 0 ] && set_session "$root_id" "$new_sid"
 
   # Track cost if the harness reports it (per-thread cumulative; thread-safe).
   cost_cents=""
@@ -1093,19 +1098,19 @@ PY
   if { [ -z "$reply" ] || [ "$reply" = "null" ]; } && [ "${REPLY_GUARD:-1}" = "1" ]; then
     echo "[$AGENT_NAME worker-$$] empty reply on $msg_id - re-prompting once (reply guard)"
     local retry_out retry_sid retry_pid retry_tpid eff_sid
-    eff_sid="${new_sid:-$sid}"
+    eff_sid="${new_sid:-$sid}"; [ "$on_fallback" = 1 ] && eff_sid=""
     retry_out="$(mktemp)"
-    invoke_harness "$AGENT_HARNESS" "$retry_out" "Your previous turn completed without posting any reply. The user is still waiting. Post your response now with the buzz CLI per your instructions. If you are blocked, say so plainly." "$harness_model" "$eff_sid" "$work_dir" "$SYSTEM_PROMPT" &
+    invoke_harness "$turn_harness" "$retry_out" "Your previous turn completed without posting any reply. The user is still waiting. Post your response now with the buzz CLI per your instructions. If you are blocked, say so plainly." "$harness_model" "$eff_sid" "$work_dir" "$SYSTEM_PROMPT" &
     retry_pid=$!
     ( sleep "$MODEL_TIMEOUT"; kill -TERM "$retry_pid" 2>/dev/null; sleep 3; kill -KILL "$retry_pid" 2>/dev/null ) &
     retry_tpid=$!
     wait "$retry_pid" 2>/dev/null
     kill "$retry_tpid" 2>/dev/null; wait "$retry_tpid" 2>/dev/null
-    reply="$(extract_harness_field "$AGENT_HARNESS" "$retry_out" result)"
-    retry_sid="$(extract_harness_field "$AGENT_HARNESS" "$retry_out" session_id)"
+    reply="$(extract_harness_field "$turn_harness" "$retry_out" result)"
+    retry_sid="$(extract_harness_field "$turn_harness" "$retry_out" session_id)"
     rm -f "$retry_out"
     [ "$reply" = "null" ] && reply=""
-    [ -n "$retry_sid" ] && { new_sid="$retry_sid"; set_session "$root_id" "$new_sid"; }
+    [ -n "$retry_sid" ] && [ "$on_fallback" = 0 ] && { new_sid="$retry_sid"; set_session "$root_id" "$new_sid"; }
   fi
 
   [ -z "$reply" ] && reply="(no reply produced - check $STATE logs)"
