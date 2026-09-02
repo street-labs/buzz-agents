@@ -18,10 +18,10 @@ setup:
       fi
     done
     harness=0
-    for h in claude pi goose; do
+    for h in claude pi goose codex; do
       command -v "$h" >/dev/null 2>&1 && { echo "  ok   harness: $h"; harness=1; }
     done
-    [ "$harness" = 1 ] || { echo "  MISS harness: install claude, pi, or goose"; missing=1; }
+    [ "$harness" = 1 ] || { echo "  MISS harness: install claude, pi, goose, or codex"; missing=1; }
     if [ "$missing" = 1 ]; then
       echo ""
       echo "Install the missing pieces and re-run just setup."

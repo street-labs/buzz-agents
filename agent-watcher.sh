@@ -87,6 +87,15 @@ case "$AGENT_MODEL:$AGENT_HARNESS" in
     exit 2
     ;;
 esac
+# Same trap for codex model ids. Claude Code rejects an unknown model on the first mention,
+# so without this the agent looks healthy at startup and dies on its first real message.
+case "$AGENT_MODEL:$AGENT_HARNESS" in
+  gpt-*:codex|codex*:codex) ;;
+  gpt-*:*|codex-*:*)
+    echo "[${AGENT_NAME:-agent}] config error: AGENT_MODEL=\"$AGENT_MODEL\" is an OpenAI/Codex model but AGENT_HARNESS=\"$AGENT_HARNESS\". Set AGENT_HARNESS=\"codex\"." >&2
+    exit 2
+    ;;
+esac
 AGENT_BASE_PROMPT_FILE="${AGENT_BASE_PROMPT_FILE:-$HOME/.buzz/agents/base-agent-prompt.md}"
 AGENT_PERSONA_FILE="${AGENT_PERSONA_FILE:-}"
 AGENT_GUARDRAIL="${AGENT_GUARDRAIL:-branch-pr}"
@@ -165,6 +174,8 @@ WORKERS="$STATE/workers"; mkdir -p "$WORKERS"  # worker pid files: $WORKERS/<msg
 COSTS="$STATE/costs.tsv"; touch "$COSTS"        # root_id \t cumulative_cost_usd \t cumulative_tokens
 LASTTURN="$STATE/lastturn.tsv"; touch "$LASTTURN"  # root_id \t created_at of last answered msg (delta-context key)
 FRESHNEXT="$STATE/freshnext.txt"; touch "$FRESHNEXT"  # roots whose next turn starts a fresh harness session
+CARRY="$STATE/carry"; mkdir -p "$CARRY"        # per-root compaction summaries seeded into the next turn
+LIMITED="$STATE/limited-until"                  # epoch until which the primary harness is rate-limited
 # name<TAB>id map of channels this bot can read, for cross-channel references
 # (#name or buzz:// links). Inherited by the Claude subprocess via the env.
 export BUZZ_CHANNELS_TSV="$STATE/channels.tsv"; touch "$BUZZ_CHANNELS_TSV"
@@ -522,6 +533,129 @@ reset_thread_session() {  # $1=root
   ) 200>"$LASTTURN.lock"
 }
 
+# --- Primary-harness session limit -------------------------------------------------
+#
+# Claude Code does not error on a usage limit; it returns the limit notice as the turn
+# RESULT, so it sails through as a normal reply and gets posted to the channel. Builder did
+# exactly that twice on 2026-08-31:
+#
+#   You've hit your session limit · resets 3:10pm (America/Indianapolis)
+#
+# The notice carries a reset time, so the switch back needs no polling and no timer - just
+# compare the clock on the next turn.
+LIMIT_RE="hit your session limit"
+
+# Print the epoch the limit resets at, or nothing if the reply is not a limit notice.
+session_limit_until() {  # $1=reply text
+  printf '%s' "$1" | python3 -c '
+import sys, re, datetime
+try: from zoneinfo import ZoneInfo
+except ImportError: sys.exit(0)
+t = sys.stdin.read()
+if "hit your session limit" not in t: sys.exit(0)
+m = re.search(r"resets\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(([^)]+)\)", t, re.I)
+if not m: sys.exit(0)
+h, mi, ampm, tz = int(m.group(1)), int(m.group(2)), m.group(3).lower(), m.group(4)
+if ampm == "pm" and h != 12: h += 12
+if ampm == "am" and h == 12: h = 0
+try: z = ZoneInfo(tz)
+except Exception: sys.exit(0)
+now = datetime.datetime.now(z)
+r = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+# A reset time already past today means it is tomorrow.
+if r <= now: r += datetime.timedelta(days=1)
+print(int(r.timestamp()))
+' 2>/dev/null
+}
+
+primary_is_limited() {
+  local until; until="$(cat "$LIMITED" 2>/dev/null)"
+  [ -n "$until" ] || return 1
+  [ "$(date +%s)" -lt "$until" ] || { rm -f "$LIMITED"; return 1; }
+}
+
+# The fallback harness cannot resume the primary's session, so carry the conversation over
+# by hand. Claude Code writes every turn to ~/.claude/projects/<path-slug>/<sid>.jsonl;
+# the last handful of exchanges is ~1k tokens, small enough to prepend directly. This is
+# mechanical on purpose - you cannot ask the limited harness to summarise itself.
+bridge_from_transcript() {  # $1=session_id $2=work_dir
+  python3 -c '
+import sys, json, pathlib, re
+sid, wd = sys.argv[1], sys.argv[2]
+# Claude Code slugs the path by replacing every non-alphanumeric run with a dash, so
+# /Users/luke.street/... becomes -Users-luke-street-... . Replacing only "/" silently
+# misses the directory and the bridge comes back empty.
+slug = re.sub(r"[^A-Za-z0-9]", "-", wd)
+f = pathlib.Path.home() / ".claude" / "projects" / slug / f"{sid}.jsonl"
+if not f.exists(): sys.exit(0)
+rows = []
+for line in f.open():
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("type") not in ("user", "assistant"): continue
+    c = (d.get("message") or {}).get("content")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    if isinstance(c, str) and c.strip():
+        rows.append((d["type"], c.strip()))
+if not rows: sys.exit(0)
+print("Carried over from the previous session (the primary harness hit its usage limit):\n")
+for role, text in rows[-20:]:
+    print(f"{role}: {text[:1500]}\n")
+' "$1" "$2" 2>/dev/null
+}
+
+# Harness-agnostic compaction. Only pi exposes a native compact call; claude, codex and
+# cursor do not. But compaction is just "summarise, then start clean", and both halves
+# already exist here: invoke_harness can run a summary turn in the live session, and the
+# /fresh machinery already knows how to start the next turn clean. So the fallback is one
+# implementation that works for every harness rather than four adapters that mostly cannot
+# be written.
+#
+# Costs one model turn, unlike pi's RPC compaction. That is the price of generality.
+# $1=root $2=sid $3=harness_model $4=work_dir $5=focus
+generic_compact() {
+  local root="$1" sid="$2" hmodel="$3" wdir="$4" focus="$5"
+  local out summary pid wpid ask
+  out="$(mktemp)"
+  ask="Write a handoff summary of this session so a fresh session can continue the work without re-reading the thread.
+
+Cover: what was decided and why, the current state of the work, exact file paths touched, any command that fails and how it fails, and every open loop.
+${focus:+Preserve above all else: $focus}
+
+Output only the summary. No preamble, no sign-off, and do not post anything to Buzz."
+
+  invoke_harness "$AGENT_HARNESS" "$out" "$ask" "$hmodel" "$sid" "$wdir" "$SYSTEM_PROMPT" &
+  pid=$!
+  ( sleep "$MODEL_TIMEOUT"; kill -TERM "$pid" 2>/dev/null; sleep 3; kill -KILL "$pid" 2>/dev/null ) &
+  wpid=$!
+  wait "$pid" 2>/dev/null
+  kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+
+  summary="$(extract_harness_field "$AGENT_HARNESS" "$out" result)"
+  rm -f "$out"
+  if [ -z "$summary" ] || [ "$summary" = "null" ]; then
+    printf 'error\t0\t0\tthe summary turn produced no output; session left unchanged\n'
+    return 1
+  fi
+
+  printf '%s\n' "$summary" > "$CARRY/$root.md"
+  reset_thread_session "$root"
+  mark_fresh_next "$root"
+  printf 'ok-seeded\t0\t%s\tsummarised into a carry-over seed\n' "$(( $(printf '%s' "$summary" | wc -c | tr -d ' ') / 4 ))"
+}
+
+# Try the harness's own compaction, fall back to the generic path when it has none.
+# $1=harness $2=root $3=sid $4=harness_model $5=work_dir $6=focus
+compact_session_any() {
+  local result
+  result="$(compact_harness_session "$1" "$3" "$4" "$5" "$6")"
+  case "$(printf '%s' "$result" | cut -f4-)" in
+    *"not supported"*) generic_compact "$2" "$3" "$4" "$5" "$6" ;;
+    *) printf '%s\n' "$result" ;;
+  esac
+}
+
 mark_fresh_next() {  # $1=root
   local tmp; tmp="$(mktemp)"
   (
@@ -788,8 +922,18 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
 
   # Map canonical model name to harness-specific format. Compaction uses the same
   # model as the agent turn so the summary matches the session's reasoning style.
+  # While the primary is limited, run on the fallback harness from the start. The window
+  # expires on its own; primary_is_limited clears the marker once the clock passes it, so
+  # reverting needs no timer and no separate job.
+  local turn_harness="$AGENT_HARNESS" turn_model="$AGENT_MODEL" turn_sid="$sid"
+  if [ -n "${AGENT_FALLBACK_HARNESS:-}" ] && primary_is_limited; then
+    turn_harness="$AGENT_FALLBACK_HARNESS"; turn_model="${AGENT_FALLBACK_MODEL:-$AGENT_MODEL}"
+    turn_sid=""   # the fallback cannot resume the primary's session
+    echo "[$AGENT_NAME worker-$$] primary limited until $(cat "$LIMITED" 2>/dev/null); using $turn_harness"
+  fi
+
   local harness_model
-  harness_model="$(map_model_name "$AGENT_HARNESS" "$AGENT_MODEL")"
+  harness_model="$(map_model_name "$turn_harness" "$turn_model")"
 
   # Manual /compact is watcher-only: compact the existing session, post the outcome,
   # and return without invoking the agent for a paid turn.
@@ -799,7 +943,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
     if [ -z "$sid" ]; then
       compact_result=$'noop\t0\t0\tno harness session exists yet'
     else
-      compact_result="$(compact_harness_session "$AGENT_HARNESS" "$sid" "$harness_model" "$work_dir" "$compact_instructions")"
+      compact_result="$(compact_session_any "$AGENT_HARNESS" "$root_id" "$sid" "$harness_model" "$work_dir" "$compact_instructions")"
     fi
     compact_status="$(printf '%s' "$compact_result" | awk -F'\t' '{print $1}')"
     compact_before="$(printf '%s' "$compact_result" | awk -F'\t' '{print $2}')"
@@ -807,6 +951,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
     compact_message="$(printf '%s' "$compact_result" | cut -f4-)"
     case "$compact_status" in
       ok) control_reply="Context compacted: ${compact_before} -> ${compact_after} estimated tokens." ;;
+      ok-seeded) control_reply="Context compacted into a ~${compact_after} token carry-over summary. The next message in this thread starts a fresh session seeded with it." ;;
       noop) control_reply="No compaction needed: ${compact_message}." ;;
       *) control_reply="Context compaction failed: ${compact_message}. The session was left unchanged." ;;
     esac
@@ -819,6 +964,15 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
 
   prompt="$(printf '%s\n%s\n%s\n' "$THREAD_JSON" "$RECENT_JSON" "$CURRENT_JSON" | python3 -c "$FORMAT_CONTEXT" "$OWNER" "$BOT_PUB" "$AGENT_NAME" "$AGENT_ROSTER_FILE" "$SINCE_TS")$POST_HINT"
 
+  # A compacted thread starts clean but not empty: the summary written by generic_compact
+  # is prepended once, then consumed. Without this the compaction would just be a /fresh
+  # that also cost a turn.
+  if [ -n "$root_id" ] && [ -f "$CARRY/$root_id.md" ]; then
+    prompt="$(printf 'Context carried over from the compacted session:\n\n%s\n\n---\n\n%s' "$(cat "$CARRY/$root_id.md")" "$prompt")"
+    rm -f "$CARRY/$root_id.md"
+    echo "[$AGENT_NAME worker-$$] seeded fresh session from carry-over for $root_id"
+  fi
+
   # Record the timestamp of the message we're answering, so the next resume only pulls
   # messages newer than this (older history is already in the session).
   cur_ts="$(printf '%s' "$CURRENT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created_at',0) or 0)" 2>/dev/null || echo 0)"
@@ -827,7 +981,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   out_file="$(mktemp)"
 
   # Run agent with timeout using harness adapter
-  invoke_harness "$AGENT_HARNESS" "$out_file" "$prompt" "$harness_model" "$sid" "$work_dir" "$SYSTEM_PROMPT" &
+  invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
 
   local gpid=$!
   ( sleep "$MODEL_TIMEOUT"; kill -TERM "$gpid" 2>/dev/null; sleep 3; kill -KILL "$gpid" 2>/dev/null ) &
@@ -836,9 +990,32 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
 
   # Extract result and session using harness-aware extraction
-  reply="$(extract_harness_field "$AGENT_HARNESS" "$out_file" result)"
-  new_sid="$(extract_harness_field "$AGENT_HARNESS" "$out_file" session_id)"
-  cost_data="$(extract_harness_field "$AGENT_HARNESS" "$out_file" cost)"
+  reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
+  new_sid="$(extract_harness_field "$turn_harness" "$out_file" session_id)"
+  cost_data="$(extract_harness_field "$turn_harness" "$out_file" cost)"
+
+  # The limit notice arrives as a normal-looking reply. Catch it before it is posted,
+  # record the reset time, and re-run this turn on the fallback with the conversation
+  # bridged across - otherwise the owner gets the notice instead of an answer.
+  limit_until="$(session_limit_until "$reply")"
+  if [ -n "$limit_until" ]; then
+    printf '%s\n' "$limit_until" > "$LIMITED"
+    echo "[$AGENT_NAME worker-$$] $turn_harness hit its session limit; resets $(date -r "$limit_until" +%H:%M)"
+    if [ -n "${AGENT_FALLBACK_HARNESS:-}" ] && [ "$turn_harness" = "$AGENT_HARNESS" ]; then
+      turn_harness="$AGENT_FALLBACK_HARNESS"; turn_model="${AGENT_FALLBACK_MODEL:-$AGENT_MODEL}"
+      harness_model="$(map_model_name "$turn_harness" "$turn_model")"
+      bridge="$(bridge_from_transcript "$sid" "$work_dir")"
+      out_file="$(mktemp)"
+      echo "[$AGENT_NAME worker-$$] retrying on $turn_harness ($harness_model), bridge $(printf '%s' "$bridge" | wc -c | tr -d ' ') chars"
+      invoke_harness "$turn_harness" "$out_file" "$(printf '%s\n\n---\n\n%s' "$bridge" "$prompt")" "$harness_model" "" "$work_dir" "$SYSTEM_PROMPT" &
+      gpid=$!
+      ( sleep "$MODEL_TIMEOUT"; kill -TERM "$gpid" 2>/dev/null; sleep 3; kill -KILL "$gpid" 2>/dev/null ) & tpid=$!
+      wait "$gpid" 2>/dev/null; kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
+      reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
+      new_sid=""   # do not overwrite the primary's session id with the fallback's
+      cost_data="$(extract_harness_field "$turn_harness" "$out_file" cost)"
+    fi
+  fi
   # A PPQ 402 (drained balance) produces an empty reply - flag it before the out_file goes.
   ppq_outage=0
   { [ -z "$reply" ] || [ "$reply" = "null" ]; } && ppq_output_is_402 "$out_file" && ppq_outage=1
@@ -938,7 +1115,13 @@ PY
   # Remove 👀 from thread root before posting final reaction
   "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
 
-  if "$BUZZ" messages send --channel "$channel_id" --reply-to "$reply_target" --content "$reply" >/dev/null 2>&1; then
+  # Capture both streams: the CLI reports failures as JSON on stdout, so redirecting
+  # into a variable is the only way to learn why a post was rejected. Discarding it
+  # made "post failed" unexplainable (2026-09-02).
+  local send_out send_rc
+  send_out="$("$BUZZ" messages send --channel "$channel_id" --reply-to "$reply_target" --content "$reply" 2>&1)"
+  send_rc=$?
+  if [ "$send_rc" -eq 0 ]; then
     # (msg_id was already marked seen at worker start, above.) Record our thread role
     # on first engagement: owner if we started it (engaged via the root message),
     # guest if pulled into an existing thread.
@@ -963,7 +1146,7 @@ PY
         sid_for_compact="$new_sid"; [ -z "$sid_for_compact" ] && sid_for_compact="$sid"
         if [ -n "$sid_for_compact" ]; then
           [ -z "$watcher_action_instructions" ] && watcher_action_instructions="Preserve exact file paths, failing commands, errors, decisions, and next steps."
-          compact_result="$(compact_harness_session "$AGENT_HARNESS" "$sid_for_compact" "$harness_model" "$work_dir" "$watcher_action_instructions")"
+          compact_result="$(compact_session_any "$AGENT_HARNESS" "$root_id" "$sid_for_compact" "$harness_model" "$work_dir" "$watcher_action_instructions")"
           compact_status="$(printf '%s' "$compact_result" | awk -F'\t' '{print $1}')"
           compact_message="$(printf '%s' "$compact_result" | cut -f4-)"
           echo "[$AGENT_NAME worker-$$] agent-requested compact $compact_status for $root_id: $compact_message"
@@ -998,7 +1181,11 @@ PY
       "$BUZZ" reactions add --event "$reply_target" --emoji ":${cost_cents}c:" >/dev/null 2>&1 || true
     fi
   else
-    echo "[$AGENT_NAME worker-$$] post failed for $msg_id"
+    # A failed post loses the whole turn's answer, so keep it on disk to recover from.
+    mkdir -p "$STATE/failed-posts"
+    printf '%s' "$reply" > "$STATE/failed-posts/$msg_id.txt"
+    echo "[$AGENT_NAME worker-$$] post failed for $msg_id (rc=$send_rc, ${#reply} chars): $(printf '%s' "$send_out" | tr '\n' ' ' | cut -c1-400)"
+    echo "[$AGENT_NAME worker-$$] reply saved to $STATE/failed-posts/$msg_id.txt"
   fi
 
   # Remove worker pid file + release the per-thread lock
@@ -1006,10 +1193,15 @@ PY
   rm -f "$WORKERS/root-$root_id.pid"
 }
 
-# Reap finished workers and enforce max concurrency
+# Reap finished workers and enforce max concurrency.
+# Counts root-*.pid only: each live worker writes TWO pid files (<msg_id>.pid and
+# root-<root_id>.pid), so globbing *.pid double-counted and halved MAX_WORKERS.
+# root-*.pid is also the one holding the real worker pid - <msg_id>.pid gets $$,
+# which bash does not re-evaluate in a backgrounded function, so it holds the
+# watcher's own pid and its staleness check can never fire.
 active_worker_count() {
   local count=0
-  for pidfile in "$WORKERS"/*.pid; do
+  for pidfile in "$WORKERS"/root-*.pid; do
     [ -f "$pidfile" ] || continue
     pid="$(cat "$pidfile" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then

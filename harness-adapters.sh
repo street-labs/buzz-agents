@@ -8,7 +8,7 @@
 #   - Writes JSON output to the specified file
 #
 # Usage: source this file, then call invoke_harness with:
-#   $1=harness (claude|pi|goose)
+#   $1=harness (claude|pi|goose|codex|cursor)
 #   $2=output_file
 #   $3=prompt
 #   $4=model (provider-specific ID)
@@ -26,6 +26,12 @@ invoke_claude() {
   local out_file="$1" prompt="$2" model="$3" sid="$4" work_dir="$5" system_prompt="$6"
 
   local base_cmd="claude -p \"\$prompt\" --model \"\$model\" --append-system-prompt \"\$system_prompt\" --permission-mode bypassPermissions --output-format json"
+
+  # Claude Code is the only harness of the four with a headless compaction control:
+  # --autocompact <auto|tokens> (auto, or 100k-1M). Opt-in via AGENT_AUTOCOMPACT so the
+  # default stays whatever the CLI does today -- turning it on is a config decision, not
+  # something to change under a running agent.
+  [ -n "${AGENT_AUTOCOMPACT:-}" ] && base_cmd="$base_cmd --autocompact \"\$AGENT_AUTOCOMPACT\""
 
   if [ -n "$sid" ]; then
     ( cd "$work_dir" && eval "$base_cmd --resume \"\$sid\"" >"$out_file" 2>/dev/null </dev/null )
@@ -177,6 +183,74 @@ invoke_goose() {
   fi
 }
 
+# Codex adapter
+# Model format: gpt-5.4-codex, gpt-5.4-codex-mini (OpenAI model ids, passed through)
+# Session management: `codex exec resume <uuid>` replays a persisted session. The id comes
+# out of the --json event stream; see extract_harness_field.
+#
+# Two shape differences from the other harnesses:
+#   - `resume` is a SUBCOMMAND of `exec`, and it takes no -C/--cd, so both paths cd into
+#     work_dir in the subshell rather than passing a flag.
+#   - there is no --append-system-prompt. `-c developer_instructions=` is the equivalent
+#     (verified against 0.149.1 with --strict-config; `experimental_instructions_file` and
+#     `base_instructions` are NOT valid keys in this version). Codex also reads AGENTS.md
+#     from the working directory, which in a repo worktree is the REPO's file — so the
+#     agent's own prompt has to come through the flag, not a file.
+invoke_codex() {
+  local out_file="$1" prompt="$2" model="$3" sid="$4" work_dir="$5" system_prompt="$6"
+
+  # --output-last-message gives the final text directly, so extract_harness_field does not
+  # have to reassemble it from the event stream.
+  local last_file="${out_file}.last"
+  rm -f "$last_file"
+
+  local flags="--json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox"
+  flags="$flags --model \"\$model\" -o \"\$last_file\""
+  flags="$flags -c developer_instructions=\"\$system_prompt\""
+
+  if [ -n "$sid" ]; then
+    ( cd "$work_dir" && eval "codex exec resume $flags \"\$sid\" \"\$prompt\"" >"$out_file" 2>/dev/null </dev/null )
+  else
+    ( cd "$work_dir" && eval "codex exec $flags \"\$prompt\"" >"$out_file" 2>/dev/null </dev/null )
+  fi
+}
+
+
+# Cursor adapter
+# Model format: Cursor's own slugs (sonnet-4.5-thinking, gpt-5, ...). `cursor-agent models`
+# is the authoritative list for the logged-in account -- do not invent names here, same trap
+# as codex.
+# Session management: `--resume <chatId>` reopens a chat. The id arrives as `session_id` in
+# the result object.
+#
+# Two shape differences worth knowing:
+#   - There is NO system-prompt flag. Cursor reads `.cursor/rules` and `AGENTS.md` from the
+#     workspace, which in a repo worktree is the REPO's file, not the agent's. So the agent
+#     prompt is prepended to the turn text instead.
+#     ponytail: prepend rather than writing a rules file into the worktree -- a rules file
+#     there would get committed into a PR by accident.
+#   - It DOES report usage, and better than the others: inputTokens / outputTokens /
+#     cacheReadTokens / cacheWriteTokens broken out. Codex folds cache into inputTokens and
+#     the claude path currently records nothing at all, so this is the cleanest accounting
+#     of the three.
+invoke_cursor() {
+  local out_file="$1" prompt="$2" model="$3" sid="$4" work_dir="$5" system_prompt="$6"
+
+  local combined
+  combined="$(printf '%s\n\n---\n\n%s' "$system_prompt" "$prompt")"
+
+  # --force: allow tool calls without prompting, the equivalent of codex's
+  # --dangerously-bypass-approvals-and-sandbox. Without it the turn blocks on approval and
+  # times out headlessly.
+  local flags="--print --output-format json --force --model \"\$model\""
+
+  if [ -n "$sid" ]; then
+    ( cd "$work_dir" && eval "cursor-agent $flags --resume \"\$sid\" \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
+  else
+    ( cd "$work_dir" && eval "cursor-agent $flags \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
+  fi
+}
+
 # Main dispatch: invoke the right harness adapter
 # $1=harness name, $2=out_file, $3=prompt, $4=model, $5=sid, $6=work_dir, $7=system_prompt
 invoke_harness() {
@@ -192,8 +266,14 @@ invoke_harness() {
     goose)
       invoke_goose "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
       ;;
+    codex)
+      invoke_codex "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
+      ;;
+    cursor)
+      invoke_cursor "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
+      ;;
     *)
-      echo "Unknown harness: $harness (expected claude|pi|goose)" >&2
+      echo "Unknown harness: $harness (expected claude|pi|goose|codex|cursor)" >&2
       return 1
       ;;
   esac
@@ -347,6 +427,121 @@ print('')
         echo "0.0:0"
       fi
       ;;
+    codex)
+      # codex exec --json emits JSONL events. The final text is written separately by
+      # -o/--output-last-message, so prefer that file and only fall back to the stream.
+      if [ "$field" = "result" ]; then
+        if [ -s "${json_file}.last" ]; then
+          cat "${json_file}.last"
+        else
+          # Fallback: the stream carries the reply as item.completed / agent_message.
+          python3 -c "
+import json
+text = ''
+for line in open('$json_file'):
+    try: ev = json.loads(line)
+    except: continue
+    item = ev.get('item') or {}
+    if ev.get('type') == 'item.completed' and item.get('type') == 'agent_message':
+        text = item.get('text', '')
+print(text)
+" 2>/dev/null
+        fi
+      elif [ "$field" = "session_id" ]; then
+        # Verified against 0.149.1: the stream opens with
+        #   {"type":"thread.started","thread_id":"<uuid>"}
+        # and `codex exec resume <uuid>` reopens that same thread with its history intact.
+        # The alternate key names are kept because Codex spells this differently across its
+        # own surfaces; thread_id is the one exec --json actually emits.
+        python3 -c "
+import json, re
+UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+KEYS = ('thread_id', 'session_id', 'conversation_id', 'threadId', 'sessionId', 'conversationId')
+def find(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in KEYS and isinstance(v, str) and UUID.match(v):
+                return v
+            r = find(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find(v)
+            if r: return r
+    return None
+for line in open('$json_file'):
+    try: ev = json.loads(line)
+    except: continue
+    r = find(ev)
+    if r:
+        print(r); break
+" 2>/dev/null
+      elif [ "$field" = "cost" ]; then
+        # Usage rides a ChatGPT subscription, so there is no dollar figure to report.
+        # turn.completed.usage has no total_tokens field -- it breaks the count out, so
+        # sum the parts. Keys verified against 0.149.1.
+        python3 -c "
+import json
+total = 0
+for line in open('$json_file'):
+    try: ev = json.loads(line)
+    except: continue
+    if ev.get('type') != 'turn.completed': continue
+    u = ev.get('usage') or {}
+    total += sum(u.get(k, 0) or 0 for k in ('input_tokens', 'output_tokens', 'reasoning_output_tokens'))
+print(f'0.0:{total}')
+" 2>/dev/null || echo "0.0:0"
+      fi
+      ;;
+    cursor)
+      # `--print --output-format json` emits one result object:
+      #   {"type":"result","subtype":"success","result":"...","session_id":"...", ...}
+      # Some builds stream NDJSON instead, so try the whole file first and fall back to
+      # scanning lines for the result event.
+      if [ "$field" = "result" ] || [ "$field" = "session_id" ]; then
+        python3 -c "
+import json, sys
+key = 'result' if '$field' == 'result' else 'session_id'
+raw = open('$json_file').read()
+val = ''
+try:
+    d = json.loads(raw)
+    if isinstance(d, dict):
+        val = d.get(key) or ''
+except Exception:
+    for line in raw.splitlines():
+        try: ev = json.loads(line)
+        except Exception: continue
+        if isinstance(ev, dict) and ev.get('type') == 'result':
+            val = ev.get(key) or ''
+print(val)
+" 2>/dev/null
+      elif [ "$field" = "cost" ]; then
+        # It DOES report usage, contrary to the stream-json feature request people cite:
+        #   "usage":{"inputTokens":8224,"outputTokens":37,"cacheReadTokens":9600,
+        #            "cacheWriteTokens":0}
+        # Verified against 2026.08.25-3e8eec8. Sum all four so the number is comparable to
+        # codex, whose inputTokens already has cached context folded in. No dollar figure --
+        # usage rides a Cursor subscription.
+        python3 -c "
+import json
+raw = open('$json_file').read()
+u = {}
+try:
+    d = json.loads(raw)
+    if isinstance(d, dict): u = d.get('usage') or {}
+except Exception:
+    for line in raw.splitlines():
+        try: ev = json.loads(line)
+        except Exception: continue
+        if isinstance(ev, dict) and ev.get('type') == 'result':
+            u = ev.get('usage') or {}
+total = sum(u.get(k, 0) or 0 for k in
+            ('inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'))
+print(f'0.0:{total}')
+" 2>/dev/null || echo "0.0:0"
+      fi
+      ;;
     *)
       echo "" >&2
       return 1
@@ -388,6 +583,35 @@ map_model_name() {
         glm-5.3) echo "ppq/z-ai/glm-5.3" ;;  # GLM-5.3 via PPQ (z-ai provider)
         glm-5.2|glm) echo "ppq/z-ai/glm-5.3" ;;  # fleet default bumped to GLM-5.3 2026-08-19
         *) echo "ppq/$model" ;;  # Default to ppq provider
+      esac
+      ;;
+    codex)
+      # Slugs come from ~/.codex/models_cache.json, which is the only authoritative list --
+      # do not invent names here. A ChatGPT-account login rejects anything not in it with a
+      # 400 ("model is not supported when using Codex with a ChatGPT account"), and the
+      # rejection only shows up on the first real turn.
+      # Listed as of 0.149.1: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4,
+      # gpt-5.4-mini, gpt-5.3-codex-spark.
+      case "$model" in
+        codex) echo "gpt-5.6-terra" ;;      # verified end to end incl. session resume
+        codex-mini) echo "gpt-5.4-mini" ;;
+        codex-long) echo "gpt-5.4" ;;       # 1M context, for whole-diff review
+        *) echo "$model" ;;
+      esac
+      ;;
+    cursor)
+      # `cursor-agent models` is the authoritative list for the logged-in account. Do not
+      # invent slugs here -- same failure mode as codex, where an unlisted name is only
+      # rejected on the first real turn.
+      # Confirmed against `cursor-agent models` 2026-08-31. Aliases exist only for the
+      # models the other agents already run, so a fallback is a one-word config change;
+      # everything else passes through verbatim.
+      case "$model" in
+        cursor) echo "auto" ;;                              # Cursor routes it
+        cursor-opus) echo "claude-opus-5-thinking-high" ;;  # matches builder's claude-opus-5
+        cursor-terra) echo "gpt-5.6-terra-medium" ;;        # matches reviewer's codex default
+        cursor-composer) echo "composer-2.5" ;;             # Cursor's own model
+        *) echo "$model" ;;
       esac
       ;;
     goose)
