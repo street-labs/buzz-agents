@@ -10,7 +10,8 @@
 # Usage:
 #   new-agent.sh <name> --repo <path> --model <m> [--channel <slug|id>]
 #                       [--key <file>] [--persona <file>]
-#   --model is required (no default): router-auto | sonnet | opus | haiku | glm-5.2
+#   --model is required (no default): router-auto | sonnet | opus | haiku | glm-5.2 | codex
+#   Harness follows the model; codex-* ids need AGENT_HARNESS="codex" in the env file.
 # Example:
 #   new-agent.sh myproject --repo ~/code/myproject --key ~/.buzz/myproject-bot.key
 set -euo pipefail
@@ -45,7 +46,7 @@ badmin() { BUZZ_PRIVATE_KEY="$(cat "$ADMIN_KEY")" "$BUZZ" "$@"; }
 [ -n "$REPO" ] || { echo "--repo is required"; exit 2; }
 # --model is required: no default, so an agent is never silently born on an expensive
 # model.
-[ -n "$MODEL" ] || { echo "--model is required (no default - name it, e.g. --model router-auto). Options: router-auto|sonnet|opus|haiku|glm-5.2"; exit 2; }
+[ -n "$MODEL" ] || { echo "--model is required (no default - name it, e.g. --model router-auto). Options: router-auto|sonnet|opus|haiku|glm-5.2|codex|codex-mini|codex-long"; exit 2; }
 REPO="${REPO/#\~/$HOME}"
 [ -d "$REPO/.git" ] || { echo "repo not a git checkout: $REPO"; exit 2; }
 
