@@ -174,6 +174,7 @@ AGENT_KEY_FILE="$KEY"
 AGENT_REPO="$SCOPED_DIR/worktree"
 AGENT_MODEL="$MODEL"
 AGENT_GUARDRAIL="branch-pr"
+AGENT_HARNESS="pi"
 AGENT_BASE_PROMPT_FILE="/Users/$NAME/base-agent-prompt.md"
 AGENT_PERSONA_FILE="/Users/$NAME/persona.md"
 # Community relay. Scope = every channel this bot is a member of on that relay.
