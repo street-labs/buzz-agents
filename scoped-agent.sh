@@ -174,14 +174,25 @@ AGENT_KEY_FILE="$KEY"
 AGENT_REPO="$SCOPED_DIR/worktree"
 AGENT_MODEL="$MODEL"
 AGENT_GUARDRAIL="branch-pr"
-AGENT_BASE_PROMPT_FILE="$AGENTS_DIR/base-agent-prompt.md"
-AGENT_PERSONA_FILE="$PERSONA"
+AGENT_BASE_PROMPT_FILE="/Users/$NAME/base-agent-prompt.md"
+AGENT_PERSONA_FILE="/Users/$NAME/persona.md"
 # Community relay. Scope = every channel this bot is a member of on that relay.
 BUZZ_RELAY_URL="$RELAY"
 # Wrap every worker in the seatbelt profile (deny writes outside the worktree).
-AGENT_SANDBOX_EXEC="sandbox-exec -f $SANDBOX"
+AGENT_SANDBOX_EXEC="sandbox-exec -f /Users/$NAME/sandbox.sb"
+# Pin watcher state to the sandbox user's home. Without this, a sudo launch
+# (HOME stays the operator's) collides the singleton lock with any same-named
+# local agent and resolves harness-adapters.sh wrong.
+AGENTS_DIR="/Users/$NAME/.buzz/agents"
 EOF
 echo "config: $CONF"
+
+# Stage everything the sandbox user's home needs next to the config: watcher,
+# adapters, base prompt, and the lock parent dir (mkdir without -p upstream).
+cp "$SRC_DIR/agent-watcher.sh" "$SRC_DIR/harness-adapters.sh" "$SRC_DIR/base-agent-prompt.md" "$SCOPED_DIR/" 2>/dev/null || \
+  cp "$AGENTS_DIR/agent-watcher.sh" "$AGENTS_DIR/harness-adapters.sh" "$AGENTS_DIR/base-agent-prompt.md" "$SCOPED_DIR/"
+chmod +x "$SCOPED_DIR/agent-watcher.sh" "$SCOPED_DIR/harness-adapters.sh" 2>/dev/null || true
+mkdir -p "$SCOPED_DIR/dot-buzz-agents/$NAME"
 
 step "5. worktree (fresh clone for the sandbox user)"
 if [ -d "$SCOPED_DIR/worktree/.git" ]; then
@@ -197,15 +208,23 @@ PREP DONE. What is left (human, at the console):
 1. Create the macOS user (System Settings > Users & Groups > Add Account,
    standard user named "$NAME"), or via CLI:
      sudo sysadminctl -addUser $NAME -password '<random>'   # then disable login window show
-2. Hand the prepared dir to that user:
+2. Hand the prepared dir to that user (run on the machine itself; a terminal
+   without Full Disk Access cannot see ~/.buzz - rsync from a /tmp copy instead):
      sudo rsync -a "$SCOPED_DIR/" "/Users/$NAME/" && sudo chown -R $NAME:staff "/Users/$NAME"
-3. In the community workspace (desktop app, as admin): add bot $BOT_PUB
+     sudo -u $NAME bash -c "mkdir -p /Users/$NAME/.buzz/agents/$NAME && cp /Users/$NAME/harness-adapters.sh /Users/$NAME/.buzz/agents/"
+   (The watcher resolves harness-adapters.sh at HOME/.buzz/agents/ and its
+    singleton lock at AGENTS_DIR/NAME/.watcher.lock with plain mkdir, so that
+    parent dir MUST exist. Both learned the hard way on derrida.)
+3. Install pi auth for the sandbox user (PPQ entry ONLY, never the operator's
+   full auth.json):
+     sudo -u $NAME mkdir -p /Users/$NAME/.pi/agent
+     # place a minimal auth.json ({"ppq": ...}) + models.json there
+4. In the community workspace (desktop app, as admin): add bot $BOT_PUB
    to the channel(s) it should answer in (#$CHANNEL).
-4. Log in (or su) as $NAME and launch the watcher:
-     tmux new-session -d -s buzz-$NAME \\
-       "bash /Users/$NAME/agent-watcher.sh /Users/$NAME/$NAME.env >> /Users/$NAME/watcher.log 2>&1"
-   (install agent-watcher.sh + harness-adapters.sh alongside first: just setup
-    inside the $NAME account, or copy from $AGENTS_DIR/.)
+5. Launch the watcher as the sandbox user. The -H is NOT optional: without it
+   sudo keeps HOME pointed at the operator and every HOME path resolves wrong.
+     sudo -Hu $NAME tmux new-session -d -s buzz-$NAME \\
+       "AGENTS_DIR=/Users/$NAME/.buzz/agents bash /Users/$NAME/agent-watcher.sh /Users/$NAME/$NAME.env >> /Users/$NAME/watcher.log 2>&1"
 
 Verify the sandbox from any account:
   sandbox-exec -f "$SANDBOX" /usr/bin/true && echo exec-ok
