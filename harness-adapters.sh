@@ -67,6 +67,25 @@ invoke_pi() {
   fi
 }
 
+# OMP (oh-my-pi) adapter
+# Fork of pi: same --mode json event stream, but sessions resume via --resume <id>
+# (pi uses --session). Provider config lives in ~/.omp/agent/models.yml (apiKey takes
+# an env var NAME, e.g. PPQ_API_KEY).
+invoke_omp() {
+  local out_file="$1" prompt="$2" model="$3" sid="$4" work_dir="$5" system_prompt="$6"
+
+  local key_export=""
+  [ -n "${PPQ_API_KEY:-}" ] && key_export="export PPQ_API_KEY=\"\$PPQ_API_KEY\"; "
+
+  local base_cmd="${key_export}omp -p \"\$prompt\" --model \"\$model\" --append-system-prompt \"\$system_prompt\" --mode json"
+
+  if [ -n "$sid" ]; then
+    ( cd "$work_dir" && eval "$base_cmd --resume \"\$sid\"" >"$out_file" 2>&1 </dev/null )
+  else
+    ( cd "$work_dir" && eval "$base_cmd" >"$out_file" 2>&1 </dev/null )
+  fi
+}
+
 # Compact a pi session through RPC mode. Prints:
 #   ok\ttokens_before\ttokens_after\tmessage
 #   noop\t0\t0\tmessage
@@ -86,6 +105,9 @@ import time
 sid, model, work_dir, instructions = sys.argv[1:5]
 cwd = work_dir if work_dir and os.path.isdir(work_dir) else None
 cmd = ["pi", "--mode", "rpc", "--session", sid]
+import os
+if os.environ.get("OMP_COMPACT") == "1":
+    cmd = ["omp", "--mode", "rpc", "--resume", sid]
 if model:
     cmd += ["--model", model]
 
@@ -263,6 +285,9 @@ invoke_harness() {
     pi)
       invoke_pi "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
       ;;
+    omp)
+      invoke_omp "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
+      ;;
     goose)
       invoke_goose "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
       ;;
@@ -273,7 +298,7 @@ invoke_harness() {
       invoke_cursor "$out_file" "$prompt" "$model" "$sid" "$work_dir" "$system_prompt"
       ;;
     *)
-      echo "Unknown harness: $harness (expected claude|pi|goose|codex|cursor)" >&2
+      echo "Unknown harness: $harness (expected claude|pi|omp|goose|codex|cursor)" >&2
       return 1
       ;;
   esac
@@ -285,6 +310,7 @@ compact_harness_session() {
   local harness="$1" sid="$2" model="$3" work_dir="$4" instructions="${5:-}"
   case "$harness" in
     pi) compact_pi_session "$sid" "$model" "$work_dir" "$instructions" ;;
+    omp) OMP_COMPACT=1 compact_pi_session "$sid" "$model" "$work_dir" "$instructions" ;;
     *) printf 'noop\t0\t0\tcompaction not supported for %s\n' "$harness"; return 2 ;;
   esac
 }
@@ -307,8 +333,8 @@ extract_harness_field() {
         echo "0.0:0"
       fi
       ;;
-    pi)
-      # Pi --mode json outputs streaming JSONL (one event per line)
+    pi|omp)
+      # Pi --mode json outputs streaming JSONL (one event per line; omp fork emits the same schema)
       # Extract the final assistant message text from message_update events
       if [ "$field" = "result" ]; then
         python3 -c "
@@ -571,8 +597,8 @@ map_model_name() {
         *) echo "$model" ;;  # Pass through if already in right format
       esac
       ;;
-    pi)
-      # Pi uses provider/model format; router profiles use router/ prefix
+    pi|omp)
+      # Pi/omp use provider/model format; router profiles use router/ prefix
       case "$model" in
         router-auto|router) echo "router/auto" ;;  # Intelligent routing with GLM-first open models
         router-open) echo "router/open" ;;  # GLM for all tiers
