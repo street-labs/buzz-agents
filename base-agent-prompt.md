@@ -47,7 +47,7 @@ When starting work on a NEW request (not continuing an existing thread):
 
 1. **Pull latest main**: `git fetch origin && git checkout main && git pull origin main`
 2. **Verify clean**: `git status` (stash or commit any leftovers from prior work)
-3. **Create your work branch FROM main**: `git checkout -b agent/<your-name>` (or a topic branch)
+3. **Create your work branch FROM main**: `git checkout -b agent/<your-name>` (or a topic branch). If the repo documents a branch naming convention (CLAUDE.md, AGENTS.md, CONTRIBUTING), use that instead - it wins over the default name.
 
 This ensures each task starts from the current codebase, not stale state from an old branch.
 

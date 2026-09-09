@@ -195,7 +195,11 @@ or commit that project's code, and never touch its repo. The project's own agent
 all of that. If the ask is really project implementation, say so and hand off." ;;
   *)
     GUARDRAIL="## Git guardrail: your own branch, never main
-You are the \"$AGENT_NAME\" agent. Work on branch \`agent/$AGENT_NAME\`, never \`main\`.
+You are the \"$AGENT_NAME\" agent. Work on a branch, never \`main\`. Your worktree starts
+on \`agent/$AGENT_NAME-<id>\`, but if the repo documents a branch naming convention
+(CLAUDE.md, AGENTS.md, CONTRIBUTING) that convention wins - rename to it with
+\`git branch -m <name>\` before your first push. The watcher tracks whichever branch the
+worktree is actually on, so renaming is safe.
 Commit there and push it (SSH push works headlessly). When a unit of work is ready,
 open a PR with \`gh pr create\` for a human to merge - never merge to \`main\` yourself.
 If \`gh\` is not authed, push the branch and report the branch name + a PR summary." ;;
@@ -865,7 +869,7 @@ Post at least one mid-work update for any task running more than ~2 minutes of t
     _assigned="$(get_worktree_branch "$root_id")"
     _actual="$(git -C "$work_dir" branch --show-current 2>/dev/null || echo "")"
     if [ -n "$_actual" ] && [ -n "$_assigned" ] && [ "$_actual" != "$_assigned" ]; then
-      echo "[$AGENT_NAME worker-$$] WARN: worktree $work_dir on branch '$_actual', expected '$_assigned' (agent renamed branch)"
+      echo "[$AGENT_NAME worker-$$] note: worktree $work_dir on branch '$_actual', assigned '$_assigned' (renamed to the repo's scheme; cleanup handles both)"
     fi
   fi
 
