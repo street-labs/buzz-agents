@@ -16,6 +16,7 @@ Distilled from a production multi-agent workspace. All operator-specific config
 | `harness-adapters.sh` | Uniform interface over Claude Code / pi / Goose. Sourced by the watcher; switch harnesses per-agent with two env lines. |
 | `base-agent-prompt.md` | Operating rules appended to every turn: verify-before-claim, git guardrail, progress updates, token economy, multi-agent etiquette, context controls. |
 | `new-agent.sh` | Scaffolder: mints/reuses a bot key, creates the channel, adds owner + bot as members (verified), sets up the worktree, writes the config, launches in tmux, verifies. |
+| `scoped-agent.sh` | Community-relay variant: fresh scoped key, invite-claim membership (no local admin key needed), `sandbox-exec` seatbelt profile (writes denied outside the worktree), hardened non-technical-audience persona. Prints the macOS-user steps it cannot do for you. |
 | `example.env` | Annotated agent config template. Copy to `<name>.env` and edit. |
 | `Justfile` | `just setup` installs everything and checks prerequisites. |
 

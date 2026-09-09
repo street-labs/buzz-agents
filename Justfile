@@ -51,6 +51,13 @@ new-agent name repo model:
     args=("{{name}}" --repo "{{repo}}" --model "{{model}}")
     exec "$(dirname {{justfile()}})/new-agent.sh" "${args[@]}"
 
+# Prepare a sandboxed agent for a COMMUNITY relay (community-bot pattern):
+# fresh scoped key, invite-claim membership, seatbelt profile, hardened persona.
+# Does NOT create the macOS user; it prints the exact remaining steps.
+# Usage: just new-scoped-agent scribe ~/Development/community-repo https://community.example.com
+new-scoped-agent name repo relay model="glm-5.3-flash":
+    @"$(dirname {{justfile()}})/scoped-agent.sh" "{{name}}" --repo "{{repo}}" --relay "{{relay}}" --model "{{model}}"
+
 # List running watchers (tmux sessions named buzz-*).
 status:
     @tmux ls 2>/dev/null | grep '^buzz-' || echo "No agent watchers running."
