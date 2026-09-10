@@ -25,7 +25,7 @@ set_worktree() {
   ) 200>"$WORKTREES.lock"
 }
 # functions under test, extracted verbatim
-eval "$(sed -n '/^claim_free_slot() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
 eval "$(sed -n '/^create_worktree() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
@@ -61,4 +61,17 @@ tmp=$(mktemp); awk -F'\t' '$1!="dddddddd44444444"' "$WORKTREES" > "$tmp"; mv "$t
 w5=$(create_worktree eeeeeeee55555555 2>/dev/null)
 [ "$w5" != "$w4" ] || fail "reclaimed a dirty slot"
 echo "ok: dirty slot not reclaimed (got $w5)"
+# A stale slot holding unpushed commits IS reclaimed, and the work survives.
+# w2 already carries the unpushed "unpushed work" commit from the case above.
+old_branch=$(git -C "$w2" branch --show-current)
+old_sha=$(git -C "$w2" rev-parse HEAD)
+echo "uncommitted too" >> "$w2/a.txt"
+find "$w2" -type f -not -path '*/.git/*' -exec touch -t 202001010000 {} + 2>/dev/null
+w6=$(create_worktree ffffffff66666666 2>/dev/null)
+[ "$w6" = "$w2" ] || fail "stale slot with unpushed work should be reclaimed, got $w6"
+git -C "$w2" rev-parse --verify "$old_branch" >/dev/null 2>&1 || fail "reclaim deleted the branch holding unpushed work"
+git -C "$w2" merge-base --is-ancestor "$old_sha" "$old_branch" || fail "reclaim lost the unpushed commit"
+git -C "$w2" log -1 --format=%s "$old_branch" | grep -q "^WIP: parked by watcher" || fail "uncommitted changes were not parked"
+echo "ok: stale slot reclaimed, commits and uncommitted work preserved on $old_branch"
+
 echo "ALL PASS"
