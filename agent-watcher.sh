@@ -828,8 +828,12 @@ create_worktree() {
     n=0
     while [ -e "$base_dir/$AGENT_NAME-slot-$n" ]; do n=$((n + 1)); done
     wt_path="$base_dir/$AGENT_NAME-slot-$n"
+    # -b fails if the branch already exists, which is what a thread whose worktree
+    # was deleted out from under it hits: the branch outlives the directory. Attach
+    # the existing branch rather than falling through to the main repo.
     ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
-      git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 ) || {
+      { git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 || \
+        git worktree add "$wt_path" "$branch" >/dev/null 2>&1; } ) || {
       echo "[$AGENT_NAME] worktree creation failed for $root" >&2
       echo "$AGENT_REPO"
       return 1
@@ -1062,6 +1066,16 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
     # after its PR merged - fall back to the main repo so `pi --session` / `claude
     # --resume` finds the session (an empty work_dir would run in the wrong project).
     [ -z "$work_dir" ] && work_dir="$AGENT_REPO"
+    # The path can be gone while the row survives: an external reaper sweeps clean
+    # worktrees, and a slot claimed by another thread is reset out from under this
+    # one. cd into a missing dir kills the turn before the harness starts, so the
+    # agent answers a follow-up with silence. Cut a replacement instead - the
+    # session id does not depend on the path, so the resume still carries the
+    # conversation, and create_worktree puts the thread back on its own branch.
+    if [ ! -d "$work_dir" ]; then
+      echo "[$AGENT_NAME worker-$$] worktree gone: $work_dir - cutting a replacement" >&2
+      if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")"; fi
+    fi
   else
     # New thread: direct-main agents work in the main repo; branch-pr
     # agents get an isolated per-thread worktree cut from fresh main.

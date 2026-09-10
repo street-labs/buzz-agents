@@ -91,4 +91,17 @@ w8=$(create_worktree $r 2>/dev/null)
 [ -f "$w8/feature.txt" ] || fail "resurrected thread lost its file"
 echo "ok: thread resurrected onto its own branch at $kept_sha"
 
+# A worktree can be deleted while its row survives - the external reaper sweeps
+# clean ones, and reviewer worktrees hold nothing by construction. The thread must
+# get a live directory back, not the dead path: a resume cds into it and dies
+# before the harness starts.
+r2=77777777bbbbbbbb
+w9=$(create_worktree $r2 2>/dev/null)
+git -C "$AGENT_REPO" worktree remove --force "$w9" >/dev/null 2>&1 || fail "could not remove $w9"
+[ "$(get_worktree $r2)" = "$w9" ] || fail "row should still point at the removed path"
+w10=$(create_worktree $r2 2>/dev/null)
+[ -d "$w10" ] || fail "handed back a path that does not exist: $w10"
+[ "$(get_worktree $r2)" = "$w10" ] || fail "row not repointed at the live worktree"
+echo "ok: deleted worktree replaced with a live one ($w10)"
+
 echo "ALL PASS"
