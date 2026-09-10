@@ -24,6 +24,15 @@
 set -uo pipefail
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$HOME/.claude/local:$HOME/.buzz/bin:/usr/bin:/bin:$PATH"
 
+# launchd starts us with no locale, so Ruby and Python default to US-ASCII. Build
+# tooling that pipes through Ruby dies on the first non-ASCII byte of compiler
+# output — xcpretty raises "invalid byte sequence in US-ASCII", and because
+# fastlane pipes xcodebuild through it under `set -o pipefail`, a build that
+# compiled cleanly is reported as a failure. It never reproduces in a terminal,
+# where the locale is already set.
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
 # PPQ_API_KEY: pi's ppq provider reads it ONLY from the environment - it does NOT fall
 # back to ~/.pi/agent/auth.json (a turn with no key returns an empty assistant message,
 # which the bot then posts). Agents launched from a `tmux new-session`,
@@ -170,6 +179,10 @@ SEEN="$STATE/seen.txt"; touch "$SEEN"
 THREADS="$STATE/threads.txt"; touch "$THREADS"
 SESSIONS="$STATE/sessions.tsv"; touch "$SESSIONS"
 WORKTREES="$STATE/worktrees.tsv"; touch "$WORKTREES"
+# Append-only record of where a released slot's work went: root_id, branch, sha,
+# timestamp. A slot's path is reused by the next thread, so this is how a thread
+# that comes back after its slot was recycled finds its own code again.
+ARCHIVE="$STATE/slot-archive.tsv"; touch "$ARCHIVE"
 WORKERS="$STATE/workers"; mkdir -p "$WORKERS"  # worker pid files: $WORKERS/<msg_id>.pid
 COSTS="$STATE/costs.tsv"; touch "$COSTS"        # root_id \t cumulative_cost_usd \t cumulative_tokens
 LASTTURN="$STATE/lastturn.tsv"; touch "$LASTTURN"  # root_id \t created_at of last answered msg (delta-context key)
@@ -688,30 +701,147 @@ consume_fresh_next() {  # $1=root; returns 0 and clears when marked
   [ "$found" = 0 ]
 }
 
+# A worktree path that no live thread claims, or empty if there is none.
+#
+# Slots are recycled rather than deleted because a worktree's path is what makes
+# a build incremental: Xcode keys DerivedData on absolute source paths, and npm
+# and CocoaPods install into the tree itself. A fresh path throws all of that
+# away, which on a large iOS repo is a 40 minute cold build and several GB, every
+# thread. Reusing the path keeps node_modules, Pods and DerivedData warm.
+#
+archive_slot() {
+  local root="$1" wt="$2" branch="$3" sha
+  [ -n "$branch" ] || return 0
+  sha="$(git -C "$wt" rev-parse "$branch" 2>/dev/null || echo "")"
+  [ -n "$sha" ] || return 0
+  ( flock 200; printf '%s\t%s\t%s\t%s\n' "$root" "$branch" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$ARCHIVE" ) 200>"$ARCHIVE.lock"
+}
+
+# The branch a returning thread should be put back on, or empty to start from
+# origin/main. Prefers the archive; falls back to the name the watcher would have
+# assigned, which covers threads whose slot was reclaimed without ever being
+# released through cleanup_worktree.
+resurrect_branch() {
+  local root="$1" short_id="${1:0:8}" branch
+  branch="$(flock "$ARCHIVE" awk -F'\t' -v r="$root" '$1==r{b=$2} END{print b}' "$ARCHIVE")"
+  [ -z "$branch" ] && branch="agent/$AGENT_NAME-$short_id"
+  git -C "$AGENT_REPO" rev-parse --verify --quiet "$branch" >/dev/null 2>&1 || return 1
+  # Refuse if some other worktree still has it checked out.
+  git -C "$AGENT_REPO" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/$branch" && return 1
+  echo "$branch"
+}
+
+# Reclaim happens in two tiers, because refusing outright to touch a slot holding
+# unpushed work would leak slots forever: most threads never open a PR, so their
+# slot is never released by cleanup_worktree and would sit poisoned for good.
+#
+#   fresh  - clean, everything pushed. Reclaim and drop the old branch.
+#   stale  - untouched for SLOT_STALE_DAYS. Reclaim, but first commit anything
+#            uncommitted and keep the branch, so the work survives in the repo as
+#            a ref even though the path is reused. Nothing is ever deleted, it
+#            just stops occupying a slot.
+#
+# A slot the current thread list still claims is never touched at either tier.
+SLOT_STALE_DAYS="${SLOT_STALE_DAYS:-3}"
+
+slot_is_stale() {
+  # No file modified inside the window. -mtime, not -newermt: find here may be
+  # bfs, which rejects relative timestamps and would exit non-zero, and an
+  # erroring find prints nothing, which reads as "stale" - the unsafe direction.
+  local slot="$1" recent
+  recent="$(find "$slot" -type f -mtime "-${SLOT_STALE_DAYS}" -not -path '*/.git/*' -print 2>/dev/null | head -1)"
+  [ -z "$recent" ]
+}
+
+claim_free_slot() {
+  local base_dir="$1" slot stale_candidate=""
+  for slot in "$base_dir/$AGENT_NAME-slot-"*; do
+    [ -d "$slot" ] || continue
+    flock "$WORKTREES" grep -qF "	$slot	" "$WORKTREES" && continue
+
+    if [ -z "$(git -C "$slot" status --porcelain 2>/dev/null)" ] &&
+       [ -z "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ]; then
+      echo "$slot"
+      return 0
+    fi
+
+    # Holds work. Usable only once it has gone quiet, and preferred least.
+    [ -z "$stale_candidate" ] && slot_is_stale "$slot" && stale_candidate="$slot"
+  done
+
+  [ -n "$stale_candidate" ] || return 1
+
+  # Park uncommitted work on the branch so reusing the path cannot lose it.
+  if [ -n "$(git -C "$stale_candidate" status --porcelain 2>/dev/null)" ]; then
+    git -C "$stale_candidate" add -A >/dev/null 2>&1 || true
+    git -C "$stale_candidate" commit -qm \
+      "WIP: parked by watcher before reclaiming slot after ${SLOT_STALE_DAYS}d idle" >/dev/null 2>&1 || true
+  fi
+  echo "[$AGENT_NAME] reclaiming stale slot $stale_candidate (work kept on $(git -C "$stale_candidate" branch --show-current 2>/dev/null))" >&2
+  echo "$stale_candidate"
+}
+
 create_worktree() {
-  local root="$1" repo_name base_dir wt_path branch short_id
+  local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n prior=""
   repo_name="$(basename "$AGENT_REPO")"
   base_dir="$(dirname "$AGENT_REPO")/${repo_name}-worktrees"
   mkdir -p "$base_dir"
   short_id="${root:0:8}"
-  wt_path="$base_dir/$short_id"
   branch="agent/$AGENT_NAME-$short_id"
 
-  [ -d "$wt_path" ] && { echo "$wt_path"; return 0; }
+  # This thread already has one (including pre-slot worktrees named by root id).
+  existing="$(get_worktree "$root")"
+  [ -n "$existing" ] && [ -d "$existing" ] && { echo "$existing"; return 0; }
+  [ -d "$base_dir/$short_id" ] && { echo "$base_dir/$short_id"; return 0; }
 
-  ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
-    git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 ) || {
-    echo "[$AGENT_NAME] worktree creation failed for $root" >&2
-    echo "$AGENT_REPO"
-    return 1
-  }
+  if wt_path="$(claim_free_slot "$base_dir")"; then
+    old_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "")"
+    # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
+    # output, which is the entire point of recycling the slot.
+    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 ) || true
+    # A thread that lost its slot gets put back on its own branch, not origin/main.
+    if prior="$(resurrect_branch "$root")"; then
+      branch="$prior"
+      echo "[$AGENT_NAME] resurrecting $root onto $branch" >&2
+    fi
+    if ! ( git -C "$wt_path" checkout -B "$branch" "${prior:-origin/main}" >/dev/null 2>&1 && \
+           git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
+           git -C "$wt_path" clean -fd >/dev/null 2>&1 ); then
+      echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
+      wt_path=""
+    else
+      # Only drop the old branch if it holds nothing a remote does not already
+      # have. A reclaimed stale slot keeps its branch so the work stays findable.
+      if [ -n "$old_branch" ] && [ "$old_branch" != "$branch" ] &&
+         [ -z "$(git -C "$wt_path" log --oneline "$old_branch" --not --remotes 2>/dev/null)" ]; then
+        ( cd "$AGENT_REPO" && git branch -D "$old_branch" >/dev/null 2>&1 ) || true
+      fi
+      echo "[$AGENT_NAME] recycled slot: $wt_path (branch $branch)" >&2
+    fi
+  else
+    wt_path=""
+  fi
+
+  # No free slot, or the reset failed. Cut a new slot rather than block: running
+  # out of slots must never stop a new thread from starting work.
+  if [ -z "$wt_path" ]; then
+    n=0
+    while [ -e "$base_dir/$AGENT_NAME-slot-$n" ]; do n=$((n + 1)); done
+    wt_path="$base_dir/$AGENT_NAME-slot-$n"
+    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
+      git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 ) || {
+      echo "[$AGENT_NAME] worktree creation failed for $root" >&2
+      echo "$AGENT_REPO"
+      return 1
+    }
+    echo "[$AGENT_NAME] created worktree: $wt_path (branch $branch)" >&2  # log to stderr; stdout is the captured path
+  fi
 
   # Initialize submodules (if the repo has any) so hooks and scripts are present;
   # git worktree add does not auto-init submodules.
   git -C "$wt_path" submodule update --init --recursive >/dev/null 2>&1 || true
 
   set_worktree "$root" "$wt_path" "$branch"
-  echo "[$AGENT_NAME] created worktree: $wt_path (branch $branch)" >&2  # log to stderr; stdout is the captured path
   echo "$wt_path"
 }
 
@@ -740,7 +870,23 @@ cleanup_worktree() {
 
   if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ] || [ "$pr_state_actual" = "MERGED" ] || [ "$pr_state_actual" = "CLOSED" ]; then
     echo "[$AGENT_NAME] cleaning up worktree $wt_path (assigned=$branch:${pr_state:-none}${actual:+ actual=$actual:${pr_state_actual:-none}})"
-    ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
+    # Slots are released, not deleted: dropping the tsv row makes the path
+    # claimable by the next thread with its build output still warm. Only the
+    # older root-id-named worktrees are actually removed.
+    case "$(basename "$wt_path")" in
+      *-slot-*)
+        archive_slot "$root" "$wt_path" "${actual:-$branch}"
+        # Back to origin/main, not HEAD: the PR is merged or closed either way, and
+        # leaving the branch's commits in place would make the slot look like it
+        # holds unpushed work once the remote branch is pruned, so it would never
+        # be reclaimed.
+        git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 || true
+        git -C "$wt_path" clean -fd >/dev/null 2>&1 || true
+        ;;
+      *)
+        ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
+        ;;
+    esac
     ( cd "$AGENT_REPO" && git branch -D "$branch" >/dev/null 2>&1 )
     [ -n "$actual" ] && [ "$actual" != "$branch" ] && ( cd "$AGENT_REPO" && git branch -D "$actual" >/dev/null 2>&1 )
     local tmp; tmp="$(mktemp)"

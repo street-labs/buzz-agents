@@ -1,0 +1,61 @@
+name: redact-check
+
+# A git hook cannot see a PR title or body, and `gh pr create` runs no hooks at all,
+# so the same denylist is enforced here on every edit to the PR as well as on the
+# commits it carries.
+#
+# Patterns come from the REDACT_DENYLIST repo secret, one extended-regex per line.
+# They are never printed: a match reports only which line of the list it hit, and
+# GitHub masks secret values in logs regardless.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan PR title, body and commit messages
+        env:
+          DENYLIST: ${{ secrets.REDACT_DENYLIST }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          if [ -z "${DENYLIST:-}" ]; then
+            echo "::error::REDACT_DENYLIST secret is not set. This check cannot pass without it."
+            exit 1
+          fi
+
+          {
+            printf '%s\n' "$PR_TITLE"
+            printf '%s\n' "$PR_BODY"
+            git log --format='%s%n%b' "$BASE_SHA..$HEAD_SHA"
+          } > /tmp/haystack.txt
+
+          n=0; bad=0
+          while IFS= read -r pat; do
+            n=$((n + 1))
+            case "$pat" in ''|'#'*) continue ;; esac
+            if grep -qiE "$pat" /tmp/haystack.txt; then
+              echo "::error::PR title, body or a commit message matches denylist entry on line $n."
+              bad=1
+            fi
+          done <<< "$DENYLIST"
+
+          [ "$bad" = 0 ] || {
+            echo "This repository is public. Reword the offending text and push again."
+            exit 1
+          }
+          echo "clean: $n denylist entries checked"
