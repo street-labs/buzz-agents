@@ -179,6 +179,10 @@ SEEN="$STATE/seen.txt"; touch "$SEEN"
 THREADS="$STATE/threads.txt"; touch "$THREADS"
 SESSIONS="$STATE/sessions.tsv"; touch "$SESSIONS"
 WORKTREES="$STATE/worktrees.tsv"; touch "$WORKTREES"
+# Append-only record of where a released slot's work went: root_id, branch, sha,
+# timestamp. A slot's path is reused by the next thread, so this is how a thread
+# that comes back after its slot was recycled finds its own code again.
+ARCHIVE="$STATE/slot-archive.tsv"; touch "$ARCHIVE"
 WORKERS="$STATE/workers"; mkdir -p "$WORKERS"  # worker pid files: $WORKERS/<msg_id>.pid
 COSTS="$STATE/costs.tsv"; touch "$COSTS"        # root_id \t cumulative_cost_usd \t cumulative_tokens
 LASTTURN="$STATE/lastturn.tsv"; touch "$LASTTURN"  # root_id \t created_at of last answered msg (delta-context key)
@@ -705,6 +709,28 @@ consume_fresh_next() {  # $1=root; returns 0 and clears when marked
 # away, which on a large iOS repo is a 40 minute cold build and several GB, every
 # thread. Reusing the path keeps node_modules, Pods and DerivedData warm.
 #
+archive_slot() {
+  local root="$1" wt="$2" branch="$3" sha
+  [ -n "$branch" ] || return 0
+  sha="$(git -C "$wt" rev-parse "$branch" 2>/dev/null || echo "")"
+  [ -n "$sha" ] || return 0
+  ( flock 200; printf '%s\t%s\t%s\t%s\n' "$root" "$branch" "$sha" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$ARCHIVE" ) 200>"$ARCHIVE.lock"
+}
+
+# The branch a returning thread should be put back on, or empty to start from
+# origin/main. Prefers the archive; falls back to the name the watcher would have
+# assigned, which covers threads whose slot was reclaimed without ever being
+# released through cleanup_worktree.
+resurrect_branch() {
+  local root="$1" short_id="${1:0:8}" branch
+  branch="$(flock "$ARCHIVE" awk -F'\t' -v r="$root" '$1==r{b=$2} END{print b}' "$ARCHIVE")"
+  [ -z "$branch" ] && branch="agent/$AGENT_NAME-$short_id"
+  git -C "$AGENT_REPO" rev-parse --verify --quiet "$branch" >/dev/null 2>&1 || return 1
+  # Refuse if some other worktree still has it checked out.
+  git -C "$AGENT_REPO" worktree list --porcelain 2>/dev/null | grep -qx "branch refs/heads/$branch" && return 1
+  echo "$branch"
+}
+
 # Reclaim happens in two tiers, because refusing outright to touch a slot holding
 # unpushed work would leak slots forever: most threads never open a PR, so their
 # slot is never released by cleanup_worktree and would sit poisoned for good.
@@ -756,7 +782,7 @@ claim_free_slot() {
 }
 
 create_worktree() {
-  local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n
+  local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n prior=""
   repo_name="$(basename "$AGENT_REPO")"
   base_dir="$(dirname "$AGENT_REPO")/${repo_name}-worktrees"
   mkdir -p "$base_dir"
@@ -773,8 +799,13 @@ create_worktree() {
     # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
     # output, which is the entire point of recycling the slot.
     ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 ) || true
-    if ! ( git -C "$wt_path" checkout -B "$branch" origin/main >/dev/null 2>&1 && \
-           git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 && \
+    # A thread that lost its slot gets put back on its own branch, not origin/main.
+    if prior="$(resurrect_branch "$root")"; then
+      branch="$prior"
+      echo "[$AGENT_NAME] resurrecting $root onto $branch" >&2
+    fi
+    if ! ( git -C "$wt_path" checkout -B "$branch" "${prior:-origin/main}" >/dev/null 2>&1 && \
+           git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" clean -fd >/dev/null 2>&1 ); then
       echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
       wt_path=""
@@ -844,6 +875,7 @@ cleanup_worktree() {
     # older root-id-named worktrees are actually removed.
     case "$(basename "$wt_path")" in
       *-slot-*)
+        archive_slot "$root" "$wt_path" "${actual:-$branch}"
         # Back to origin/main, not HEAD: the PR is merged or closed either way, and
         # leaving the branch's commits in place would make the slot look like it
         # holds unpushed work once the remote branch is pruned, so it would never

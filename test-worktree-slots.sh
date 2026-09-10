@@ -14,6 +14,7 @@ echo hi > a.txt; echo "build/" > .gitignore; git add -A; git commit -qm init; gi
 AGENT_NAME=builder
 AGENT_REPO=$T/repo
 WORKTREES=$T/state/worktrees.tsv; touch "$WORKTREES"
+ARCHIVE=$T/state/slot-archive.tsv; touch "$ARCHIVE"
 
 get_worktree() { flock "$WORKTREES" awk -F'\t' -v r="$1" '$1==r{print $2; exit}' "$WORKTREES"; }
 set_worktree() {
@@ -25,7 +26,7 @@ set_worktree() {
   ) 200>"$WORKTREES.lock"
 }
 # functions under test, extracted verbatim
-eval "$(sed -n '/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
 eval "$(sed -n '/^create_worktree() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
@@ -73,5 +74,21 @@ git -C "$w2" rev-parse --verify "$old_branch" >/dev/null 2>&1 || fail "reclaim d
 git -C "$w2" merge-base --is-ancestor "$old_sha" "$old_branch" || fail "reclaim lost the unpushed commit"
 git -C "$w2" log -1 --format=%s "$old_branch" | grep -q "^WIP: parked by watcher" || fail "uncommitted changes were not parked"
 echo "ok: stale slot reclaimed, commits and uncommitted work preserved on $old_branch"
+
+# A thread that comes back after its slot was recycled lands on its own branch.
+r=99999999aaaaaaaa
+w7=$(create_worktree $r 2>/dev/null)
+echo "thread work" > "$w7/feature.txt"
+git -C "$w7" add -A && git -C "$w7" commit -qm "thread work"
+git -C "$w7" push -q origin "agent/builder-99999999" 2>/dev/null
+kept_sha=$(git -C "$w7" rev-parse HEAD)
+archive_slot "$r" "$w7" "agent/builder-99999999"
+tmp=$(mktemp); awk -F'\t' -v r="$r" '$1!=r' "$WORKTREES" > "$tmp"; mv "$tmp" "$WORKTREES"
+git -C "$w7" checkout -q --detach 2>/dev/null   # free the branch, as a release would
+
+w8=$(create_worktree $r 2>/dev/null)
+[ "$(git -C "$w8" rev-parse HEAD)" = "$kept_sha" ] || fail "resurrected thread did not land on its own commit"
+[ -f "$w8/feature.txt" ] || fail "resurrected thread lost its file"
+echo "ok: thread resurrected onto its own branch at $kept_sha"
 
 echo "ALL PASS"
