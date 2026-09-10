@@ -24,6 +24,15 @@
 set -uo pipefail
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$HOME/.claude/local:$HOME/.buzz/bin:/usr/bin:/bin:$PATH"
 
+# launchd starts us with no locale, so Ruby and Python default to US-ASCII. Build
+# tooling that pipes through Ruby dies on the first non-ASCII byte of compiler
+# output — xcpretty raises "invalid byte sequence in US-ASCII", and because
+# fastlane pipes xcodebuild through it under `set -o pipefail`, a build that
+# compiled cleanly is reported as a failure. It never reproduces in a terminal,
+# where the locale is already set.
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
 # PPQ_API_KEY: pi's ppq provider reads it ONLY from the environment - it does NOT fall
 # back to ~/.pi/agent/auth.json (a turn with no key returns an empty assistant message,
 # which the bot then posts). Agents launched from a `tmux new-session`,
@@ -688,30 +697,81 @@ consume_fresh_next() {  # $1=root; returns 0 and clears when marked
   [ "$found" = 0 ]
 }
 
+# A worktree path that no live thread claims, or empty if there is none.
+#
+# Slots are recycled rather than deleted because a worktree's path is what makes
+# a build incremental: Xcode keys DerivedData on absolute source paths, and npm
+# and CocoaPods install into the tree itself. A fresh path throws all of that
+# away, which on a large iOS repo is a 40 minute cold build and several GB, every
+# thread. Reusing the path keeps node_modules, Pods and DerivedData warm.
+#
+# A slot is only reclaimed when it is clean and every commit is on a remote, so
+# unpushed work is never recycled out from under an agent.
+claim_free_slot() {
+  local base_dir="$1" slot
+  for slot in "$base_dir/$AGENT_NAME-slot-"*; do
+    [ -d "$slot" ] || continue
+    flock "$WORKTREES" grep -qF "	$slot	" "$WORKTREES" && continue
+    [ -n "$(git -C "$slot" status --porcelain 2>/dev/null)" ] && continue
+    [ -n "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ] && continue
+    echo "$slot"
+    return 0
+  done
+  return 1
+}
+
 create_worktree() {
-  local root="$1" repo_name base_dir wt_path branch short_id
+  local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n
   repo_name="$(basename "$AGENT_REPO")"
   base_dir="$(dirname "$AGENT_REPO")/${repo_name}-worktrees"
   mkdir -p "$base_dir"
   short_id="${root:0:8}"
-  wt_path="$base_dir/$short_id"
   branch="agent/$AGENT_NAME-$short_id"
 
-  [ -d "$wt_path" ] && { echo "$wt_path"; return 0; }
+  # This thread already has one (including pre-slot worktrees named by root id).
+  existing="$(get_worktree "$root")"
+  [ -n "$existing" ] && [ -d "$existing" ] && { echo "$existing"; return 0; }
+  [ -d "$base_dir/$short_id" ] && { echo "$base_dir/$short_id"; return 0; }
 
-  ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
-    git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 ) || {
-    echo "[$AGENT_NAME] worktree creation failed for $root" >&2
-    echo "$AGENT_REPO"
-    return 1
-  }
+  if wt_path="$(claim_free_slot "$base_dir")"; then
+    old_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "")"
+    # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
+    # output, which is the entire point of recycling the slot.
+    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 ) || true
+    if ! ( git -C "$wt_path" checkout -B "$branch" origin/main >/dev/null 2>&1 && \
+           git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 && \
+           git -C "$wt_path" clean -fd >/dev/null 2>&1 ); then
+      echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
+      wt_path=""
+    else
+      [ -n "$old_branch" ] && [ "$old_branch" != "$branch" ] && \
+        ( cd "$AGENT_REPO" && git branch -D "$old_branch" >/dev/null 2>&1 ) || true
+      echo "[$AGENT_NAME] recycled slot: $wt_path (branch $branch)" >&2
+    fi
+  else
+    wt_path=""
+  fi
+
+  # No free slot, or the reset failed. Cut a new slot rather than block: running
+  # out of slots must never stop a new thread from starting work.
+  if [ -z "$wt_path" ]; then
+    n=0
+    while [ -e "$base_dir/$AGENT_NAME-slot-$n" ]; do n=$((n + 1)); done
+    wt_path="$base_dir/$AGENT_NAME-slot-$n"
+    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
+      git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 ) || {
+      echo "[$AGENT_NAME] worktree creation failed for $root" >&2
+      echo "$AGENT_REPO"
+      return 1
+    }
+    echo "[$AGENT_NAME] created worktree: $wt_path (branch $branch)" >&2  # log to stderr; stdout is the captured path
+  fi
 
   # Initialize submodules (if the repo has any) so hooks and scripts are present;
   # git worktree add does not auto-init submodules.
   git -C "$wt_path" submodule update --init --recursive >/dev/null 2>&1 || true
 
   set_worktree "$root" "$wt_path" "$branch"
-  echo "[$AGENT_NAME] created worktree: $wt_path (branch $branch)" >&2  # log to stderr; stdout is the captured path
   echo "$wt_path"
 }
 
@@ -740,7 +800,22 @@ cleanup_worktree() {
 
   if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ] || [ "$pr_state_actual" = "MERGED" ] || [ "$pr_state_actual" = "CLOSED" ]; then
     echo "[$AGENT_NAME] cleaning up worktree $wt_path (assigned=$branch:${pr_state:-none}${actual:+ actual=$actual:${pr_state_actual:-none}})"
-    ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
+    # Slots are released, not deleted: dropping the tsv row makes the path
+    # claimable by the next thread with its build output still warm. Only the
+    # older root-id-named worktrees are actually removed.
+    case "$(basename "$wt_path")" in
+      *-slot-*)
+        # Back to origin/main, not HEAD: the PR is merged or closed either way, and
+        # leaving the branch's commits in place would make the slot look like it
+        # holds unpushed work once the remote branch is pruned, so it would never
+        # be reclaimed.
+        git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 || true
+        git -C "$wt_path" clean -fd >/dev/null 2>&1 || true
+        ;;
+      *)
+        ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
+        ;;
+    esac
     ( cd "$AGENT_REPO" && git branch -D "$branch" >/dev/null 2>&1 )
     [ -n "$actual" ] && [ "$actual" != "$branch" ] && ( cd "$AGENT_REPO" && git branch -D "$actual" >/dev/null 2>&1 )
     local tmp; tmp="$(mktemp)"
