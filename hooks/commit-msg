@@ -1,0 +1,24 @@
+#!/bin/sh
+# Reject commit messages that name a client, project or person that must not appear
+# in a public repo.
+#
+# The patterns themselves live OUTSIDE the repo, in $BUZZ_DENYLIST_FILE (default
+# ~/.buzz/redact-denylist), one extended-regex per line, blank lines and # comments
+# ignored. Committing the list would publish exactly what it exists to keep out.
+#
+# Installed by `just install`. CI runs the same check over PR titles and bodies.
+set -u
+LIST="${BUZZ_DENYLIST_FILE:-$HOME/.buzz/redact-denylist}"
+[ -f "$LIST" ] || exit 0
+
+n=0
+while IFS= read -r pat; do
+    n=$((n + 1))
+    case "$pat" in ''|'#'*) continue ;; esac
+    if grep -qiE "$pat" "$1"; then
+        echo "commit-msg: message matches denylist entry on line $n of $LIST" >&2
+        echo "Reword it. This repo is public." >&2
+        exit 1
+    fi
+done < "$LIST"
+exit 0
