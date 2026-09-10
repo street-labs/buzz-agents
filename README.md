@@ -86,6 +86,50 @@ Notable knobs:
 - `AGENT_PERSONA_FILE`: extra prompt text appended after the base prompt.
 - `MAX_WORKERS`, `MODEL_TIMEOUT`, `BOOT_GRACE`: concurrency and timing.
 
+## Worktree slots
+
+Each thread works in its own worktree under `<repo>-worktrees/<agent>-slot-N`. Slots
+are recycled rather than deleted: the path is what makes a build incremental, because
+build systems key their caches on absolute source paths and package managers install
+into the tree itself. Handing the next thread the same path keeps all of that warm.
+
+If no slot is free a new one is cut, so a busy day never blocks a thread from
+starting. A slot is only reclaimed when it is clean and every commit is on a remote;
+one that has gone quiet for `SLOT_STALE_DAYS` (default 3) is reclaimed too, but its
+uncommitted work is committed first and its branch kept, so nothing is lost. A thread
+that comes back after its slot was recycled is checked out onto its own branch again,
+recorded in `slot-archive.tsv`.
+
+### Warming slots ahead of time (optional)
+
+`warm-slots.sh <agent>` builds one *unclaimed* slot at `origin/main` so the thread
+that claims it next gets an incremental build rather than a cold one. Run it from a
+timer.
+
+It does not know how to build anything. If the repo has an executable
+`tools/agent-warm-slot.sh`, it runs that from the slot root; if not, it exits quietly.
+Projects that want warming write that one script; every other project is unaffected.
+
+The contract for `tools/agent-warm-slot.sh`:
+
+- it is run from the slot root, already reset to `origin/main`
+- exit 0 only if the slot is genuinely warm
+- on success write the built commit to `$(git rev-parse --absolute-git-dir)/agent-warmed-sha`
+
+That marker is compared against `origin/main` to decide whether a rewarm is due.
+There is no time-based throttle: rewarming an already-warm slot is itself incremental,
+and the idle check is what keeps it off a busy machine.
+
+What it refuses to touch: a slot a live thread has claimed, a slot with uncommitted
+changes, and a slot holding commits that are not on a remote. It also skips entirely
+when load is at or above core count or another build is running — `WARM_FORCE=1`
+overrides that for a manual run. One warm at a time across all agents, via `flock`.
+
+Warming a slot a thread is *using* would not help: two builds on one cache path
+serialise, so the agent would just wait out the warm build. Only free slots are warmed.
+
+`test-worktree-slots.sh` and `test-warm-slots.sh` cover both halves.
+
 ## Multi-agent
 
 Run several agents in one workspace and they coordinate: the watcher names the other
