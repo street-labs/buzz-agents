@@ -33,9 +33,9 @@ setup:
     echo ""
     echo "== Installing to ~/.buzz/agents =="
     mkdir -p ~/.buzz/agents
-    install -m 755 agent-watcher.sh harness-adapters.sh new-agent.sh ~/.buzz/agents/
+    install -m 755 agent-watcher.sh harness-adapters.sh new-agent.sh warm-slots.sh ~/.buzz/agents/
     install -m 644 base-agent-prompt.md example.env ~/.buzz/agents/
-    echo "  installed agent-watcher.sh, harness-adapters.sh, new-agent.sh, base-agent-prompt.md, example.env"
+    echo "  installed agent-watcher.sh, harness-adapters.sh, new-agent.sh, warm-slots.sh, base-agent-prompt.md, example.env"
     install -m 755 hooks/commit-msg .git/hooks/commit-msg
     echo "  installed commit-msg hook (denylist: ${BUZZ_DENYLIST_FILE:-~/.buzz/redact-denylist})"
     echo ""
