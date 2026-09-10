@@ -570,9 +570,9 @@ try: from zoneinfo import ZoneInfo
 except ImportError: sys.exit(0)
 t = sys.stdin.read()
 if "hit your session limit" not in t: sys.exit(0)
-m = re.search(r"resets\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(([^)]+)\)", t, re.I)
+m = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", t, re.I)
 if not m: sys.exit(0)
-h, mi, ampm, tz = int(m.group(1)), int(m.group(2)), m.group(3).lower(), m.group(4)
+h, mi, ampm, tz = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower(), m.group(4)
 if ampm == "pm" and h != 12: h += 12
 if ampm == "am" and h == 12: h = 0
 try: z = ZoneInfo(tz)
