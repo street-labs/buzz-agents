@@ -705,19 +705,54 @@ consume_fresh_next() {  # $1=root; returns 0 and clears when marked
 # away, which on a large iOS repo is a 40 minute cold build and several GB, every
 # thread. Reusing the path keeps node_modules, Pods and DerivedData warm.
 #
-# A slot is only reclaimed when it is clean and every commit is on a remote, so
-# unpushed work is never recycled out from under an agent.
+# Reclaim happens in two tiers, because refusing outright to touch a slot holding
+# unpushed work would leak slots forever: most threads never open a PR, so their
+# slot is never released by cleanup_worktree and would sit poisoned for good.
+#
+#   fresh  - clean, everything pushed. Reclaim and drop the old branch.
+#   stale  - untouched for SLOT_STALE_DAYS. Reclaim, but first commit anything
+#            uncommitted and keep the branch, so the work survives in the repo as
+#            a ref even though the path is reused. Nothing is ever deleted, it
+#            just stops occupying a slot.
+#
+# A slot the current thread list still claims is never touched at either tier.
+SLOT_STALE_DAYS="${SLOT_STALE_DAYS:-3}"
+
+slot_is_stale() {
+  # No file modified inside the window. -mtime, not -newermt: find here may be
+  # bfs, which rejects relative timestamps and would exit non-zero, and an
+  # erroring find prints nothing, which reads as "stale" - the unsafe direction.
+  local slot="$1" recent
+  recent="$(find "$slot" -type f -mtime "-${SLOT_STALE_DAYS}" -not -path '*/.git/*' -print 2>/dev/null | head -1)"
+  [ -z "$recent" ]
+}
+
 claim_free_slot() {
-  local base_dir="$1" slot
+  local base_dir="$1" slot stale_candidate=""
   for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     [ -d "$slot" ] || continue
     flock "$WORKTREES" grep -qF "	$slot	" "$WORKTREES" && continue
-    [ -n "$(git -C "$slot" status --porcelain 2>/dev/null)" ] && continue
-    [ -n "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ] && continue
-    echo "$slot"
-    return 0
+
+    if [ -z "$(git -C "$slot" status --porcelain 2>/dev/null)" ] &&
+       [ -z "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ]; then
+      echo "$slot"
+      return 0
+    fi
+
+    # Holds work. Usable only once it has gone quiet, and preferred least.
+    [ -z "$stale_candidate" ] && slot_is_stale "$slot" && stale_candidate="$slot"
   done
-  return 1
+
+  [ -n "$stale_candidate" ] || return 1
+
+  # Park uncommitted work on the branch so reusing the path cannot lose it.
+  if [ -n "$(git -C "$stale_candidate" status --porcelain 2>/dev/null)" ]; then
+    git -C "$stale_candidate" add -A >/dev/null 2>&1 || true
+    git -C "$stale_candidate" commit -qm \
+      "WIP: parked by watcher before reclaiming slot after ${SLOT_STALE_DAYS}d idle" >/dev/null 2>&1 || true
+  fi
+  echo "[$AGENT_NAME] reclaiming stale slot $stale_candidate (work kept on $(git -C "$stale_candidate" branch --show-current 2>/dev/null))" >&2
+  echo "$stale_candidate"
 }
 
 create_worktree() {
@@ -744,8 +779,12 @@ create_worktree() {
       echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
       wt_path=""
     else
-      [ -n "$old_branch" ] && [ "$old_branch" != "$branch" ] && \
+      # Only drop the old branch if it holds nothing a remote does not already
+      # have. A reclaimed stale slot keeps its branch so the work stays findable.
+      if [ -n "$old_branch" ] && [ "$old_branch" != "$branch" ] &&
+         [ -z "$(git -C "$wt_path" log --oneline "$old_branch" --not --remotes 2>/dev/null)" ]; then
         ( cd "$AGENT_REPO" && git branch -D "$old_branch" >/dev/null 2>&1 ) || true
+      fi
       echo "[$AGENT_NAME] recycled slot: $wt_path (branch $branch)" >&2
     fi
   else
