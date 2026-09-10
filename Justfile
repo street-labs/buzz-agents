@@ -36,6 +36,8 @@ setup:
     install -m 755 agent-watcher.sh harness-adapters.sh new-agent.sh ~/.buzz/agents/
     install -m 644 base-agent-prompt.md example.env ~/.buzz/agents/
     echo "  installed agent-watcher.sh, harness-adapters.sh, new-agent.sh, base-agent-prompt.md, example.env"
+    install -m 755 hooks/commit-msg .git/hooks/commit-msg
+    echo "  installed commit-msg hook (denylist: ${BUZZ_DENYLIST_FILE:-~/.buzz/redact-denylist})"
     echo ""
     echo "== Next steps =="
     echo "1. export BUZZ_RELAY_URL=\"http://<your-relay-host>:3000\""
