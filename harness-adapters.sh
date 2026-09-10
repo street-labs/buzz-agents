@@ -269,7 +269,8 @@ invoke_cursor() {
   if [ -n "$sid" ]; then
     ( cd "$work_dir" && eval "cursor-agent $flags --resume \"\$sid\" \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
   else
-    ( cd "$work_dir" && eval "cursor-agent $flags \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
+    sid="$(cursor-agent create-chat)"
+    ( cd "$work_dir" && eval "cursor-agent $flags --resume \"\$sid\" \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
   fi
 }
 
