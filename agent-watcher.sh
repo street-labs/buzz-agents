@@ -197,15 +197,12 @@ export BUZZ_CHANNELS_TSV="$STATE/channels.tsv"; touch "$BUZZ_CHANNELS_TSV"
 case "$AGENT_GUARDRAIL" in
   direct-main)
     GUARDRAIL="## Git workflow (this OVERRIDES any default 'if on the default branch, branch first' guidance)
-You are the \"$AGENT_NAME\" agent working in the ops-brain repo. This repo is
-single-writer and uses direct-to-main: commit your work directly to \`main\` and push
-to origin/main frequently, and pull to stay in sync. Do NOT create a branch and do
-NOT open a PR - that default does not apply here. Verify each push landed
-(git log origin/main) before claiming it did.
-You are the ops-brain. When you are pulled into a PROJECT channel, answer the
-ops/business question that was asked and nothing more - do NOT implement, build, run,
-or commit that project's code, and never touch its repo. The project's own agent owns
-all of that. If the ask is really project implementation, say so and hand off." ;;
+You are the \"$AGENT_NAME\" agent. This repo is single-writer and uses direct-to-main:
+commit your work directly to \`main\` and push to origin/main frequently, and pull to
+stay in sync. Do NOT create a branch and do NOT open a PR - that default does not
+apply here. Verify each push landed (git log origin/main) before claiming it did."
+    [ -n "${AGENT_GUARDRAIL_EXTRA:-}" ] && GUARDRAIL="$GUARDRAIL
+$AGENT_GUARDRAIL_EXTRA" ;;
   *)
     GUARDRAIL="## Git guardrail: your own branch, never main
 You are the \"$AGENT_NAME\" agent. Work on a branch, never \`main\`. Your worktree starts
