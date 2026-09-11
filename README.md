@@ -17,6 +17,7 @@ Distilled from a production multi-agent workspace. All operator-specific config
 | `base-agent-prompt.md` | Operating rules appended to every turn: verify-before-claim, git guardrail, progress updates, token economy, multi-agent etiquette, context controls. |
 | `new-agent.sh` | Scaffolder: mints/reuses a bot key, creates the channel, adds owner + bot as members (verified), sets up the worktree, writes the config, launches in tmux, verifies. |
 | `scoped-agent.sh` | Community-relay variant: fresh scoped key, invite-claim membership (no local admin key needed), `sandbox-exec` seatbelt profile (writes denied outside the worktree), hardened non-technical-audience persona. Prints the macOS-user steps it cannot do for you. |
+| `agent-job.sh` | Runs a long job (build, test suite) detached and reports how it ended into the thread — including when the job is killed without finishing. The watcher polls it once per cycle. |
 | `example.env` | Annotated agent config template. Copy to `<name>.env` and edit. |
 | `Justfile` | `just setup` installs everything and checks prerequisites. |
 
@@ -129,6 +130,36 @@ Warming a slot a thread is *using* would not help: two builds on one cache path
 serialise, so the agent would just wait out the warm build. Only free slots are warmed.
 
 `test-worktree-slots.sh` and `test-warm-slots.sh` cover both halves.
+
+## Long jobs
+
+A turn that starts a build and ends is a turn that has left nobody to report the
+result. The shell holding the job dies with the session, so the agent goes idle while
+its build quietly succeeds — and it looks identical to work still in progress, which
+is why it can cost a day before a human notices.
+
+`agent-job.sh` records the job on disk instead of in a live shell:
+
+```
+agent-job.sh --label "alpha build" -- make ios-build
+```
+
+It returns immediately, and the agent is told to end its turn rather than poll. The
+watcher runs `agent-job.sh --check` once per poll cycle and posts the outcome into the
+thread the job came from. That message `@`-mentions the agent, and an agent's own key
+is in `peers.txt`, so it re-summons the agent into the same session.
+
+Two cases, one of which nothing else catches:
+
+- the job ran to the end — reported with its exit code
+- the job's pid is gone and no exit code was ever written — reported as killed
+
+Channel and thread come from `BUZZ_CHANNEL`/`BUZZ_THREAD`, which the watcher exports
+into every turn, so an agent passes neither. Output goes to a log file, not into the
+agent's context; the message carries the path.
+
+`test-agent-jobs.sh` covers both outcomes, the no-double-report rule, and that a
+running job is left alone.
 
 ## Multi-agent
 
