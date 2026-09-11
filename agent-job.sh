@@ -14,6 +14,9 @@
 #   agent-job.sh --label "alpha build" -- make ios-build
 #   agent-job.sh --check          # the watcher, once per poll cycle
 #
+# The thread root carries an hourglass while a job is outstanding, so "waiting on a
+# build" and "stalled" do not look the same from the channel.
+#
 # --channel/--thread default to BUZZ_CHANNEL/BUZZ_THREAD, which the watcher exports
 # into every turn, so an agent normally passes neither.
 set -uo pipefail
@@ -44,9 +47,14 @@ check() {
         else
             msg="@$AGENT_NAME job \"$label\" finished rc=$rc. Log: $log"
         fi
-        if "$BUZZ" messages send --channel "$(field "$job" channel)" \
-             --reply-to "$(field "$job" thread)" --content "$msg" >/dev/null 2>&1; then
+        channel="$(field "$job" channel)"; thread="$(field "$job" thread)"
+        if "$BUZZ" messages send --channel "$channel" --reply-to "$thread" \
+             --content "$msg" >/dev/null 2>&1; then
             rm -f "$job" "${job%.job}.rc"
+            # Drop the hourglass only once nothing else is outstanding on this thread,
+            # or the first of two builds to finish would report the thread as idle.
+            grep -lF "thread=$thread" "$JOBS"/*.job >/dev/null 2>&1 ||
+                "$BUZZ" reactions remove --event "$thread" --emoji '⏳' >/dev/null 2>&1 || true
         else
             echo "[$AGENT_NAME job] could not post the outcome of $job" >&2
         fi
@@ -99,6 +107,11 @@ fi
 printf 'channel=%s\nthread=%s\nlabel=%s\nlog=%s\npid=%s\n' \
     "$channel" "$thread" "${label:-$1}" "$log" "$!" > "$job.tmp"
 mv "$job.tmp" "$job"   # only now is it visible to --check, pid included
+
+# The watcher's 👀 means a turn is running, and the turn is about to end. ⏳ on the
+# thread root is what tells the owner the difference between waiting on a job and
+# stalled. --check clears it when the last job on the thread reports.
+"$BUZZ" reactions add --event "$thread" --emoji '⏳' >/dev/null 2>&1 || true
 
 echo "started (pid $!): ${label:-$1}"
 echo "log: $log"
