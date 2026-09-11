@@ -264,6 +264,7 @@ try:
         assist = set(open(sys.argv[8]).read().split())
 except:
     assist = set()
+follow_peer_threads = (len(sys.argv) > 9 and sys.argv[9] == "1")
 try:
     msgs = json.load(sys.stdin)
 except:
@@ -304,11 +305,13 @@ for m in msgs:
     # normal channels where the agent follows along).
     explicitly = (me and me in ptags) or (("@" + name) in cl)
     directly = explicitly or (name in cl) or ("@builder" in cl) or ("@agent" in cl)
-    # Allow owner messages always, OR peer messages that explicitly summon us (bot-to-bot coordination).
-    if pub != owner:
-        if pub not in peers or not explicitly:
-            continue
+    # Allow owner messages always, OR peer messages that explicitly summon us (bot-to-bot
+    # coordination). AGENT_THREAD_FOLLOW_PEERS=1 additionally lets peer messages keep a
+    # thread we track going without a fresh summon (human members replying in a thread).
     in_thread = threaded and root_id in threads
+    if pub != owner:
+        if pub not in peers or (not explicitly and not (follow_peer_threads and in_thread)):
+            continue
     if mention_only:
         # Summon-only channel: act ONLY on a deliberate @mention / p-tag, then bow out.
         # A bare mention of the name (third person) or a generic @builder/@agent aimed
@@ -1447,7 +1450,7 @@ while true; do
       echo $! > "$rootpid"
       spawned_roots="$spawned_roots$root_id "
 
-    done < <(printf '%s' "$MSGS" | python3 -c "$FILTER" "$SEEN" "$OWNER" "$AGENT_NAME" "$THREADS" "$AGENT_PEERS_FILE" "$BOT_PUB" "$mo" "$AGENT_ASSIST_FILE")
+    done < <(printf '%s' "$MSGS" | python3 -c "$FILTER" "$SEEN" "$OWNER" "$AGENT_NAME" "$THREADS" "$AGENT_PEERS_FILE" "$BOT_PUB" "$mo" "$AGENT_ASSIST_FILE" "${AGENT_THREAD_FOLLOW_PEERS:-}")
   done
 
   sleep 5
