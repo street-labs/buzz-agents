@@ -15,10 +15,12 @@ mkdir -p "$HOME/.buzz/agents/builder"
 mkdir -p "$T/bin"
 cat > "$T/bin/buzz" <<'INNER'
 #!/bin/sh
-shift 4          # messages send --channel <c>
-shift 2          # --reply-to <t>
-shift            # --content
-echo "$1" >> "$SENT"
+if [ "$1" = reactions ]; then
+    echo "reaction $2 $6" >> "$SENT"       # reactions add|remove --event <id> --emoji <e>
+else
+    shift 7                                # messages send --channel <c> --reply-to <t> --content
+    echo "$1" >> "$SENT"
+fi
 INNER
 chmod +x "$T/bin/buzz"
 export BUZZ="$T/bin/buzz" SENT="$T/sent.log"; : > "$SENT"
@@ -28,8 +30,9 @@ posted() { grep -qF "$1" "$SENT"; }
 
 # 1. a job still running is not reported, and does not lose its place
 bash "$JOB" --label slow -- sleep 30 >/dev/null || fail "could not start a job"
+posted "reaction add" || fail "no reaction marking the thread as waiting on a job"
 bash "$JOB" --check
-[ -s "$SENT" ] && fail "reported a job that is still running"
+grep -qv reaction "$SENT" 2>/dev/null && grep -q 'finished\|stopped' "$SENT" && fail "reported a job that is still running"
 [ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 1 ] || fail "lost the running job's file"
 
 # 2. a job that succeeds is reported with rc=0, once, then forgotten
@@ -79,5 +82,14 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash "$T/launch.sh" ) >/dev/null 2>&1
 sleep 1
 kill -0 "$(cat "$T/orphan.pid" 2>/dev/null)" 2>/dev/null || fail "job died with the caller's process group"
 pkill -f 'sleep 8' 2>/dev/null
+
+# 8. the waiting reaction survives until the LAST job on the thread reports, so two
+#    builds at once do not make the thread look idle after the first one lands
+posted "reaction remove" && fail "cleared the waiting reaction while a job was still running"
+pkill -f 'sleep 30' 2>/dev/null
+sleep 1
+bash "$JOB" --check
+posted "reaction remove" || fail "never cleared the waiting reaction"
+[ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 0 ] || fail "left a job file behind"
 
 echo "PASS"; rm -rf "$T"

@@ -154,6 +154,12 @@ Two cases, one of which nothing else catches:
 - the job ran to the end — reported with its exit code
 - the job's pid is gone and no exit code was ever written — reported as killed
 
+While a job is outstanding the thread root carries ⏳. The watcher's 👀 means a turn is
+running, and the turn ends as soon as the job is started, so without this an agent
+waiting on a 40-minute build is indistinguishable from one that has stalled. It clears
+when the last job on that thread reports — two builds at once do not make the thread
+look idle after the first one lands.
+
 Channel and thread come from `BUZZ_CHANNEL`/`BUZZ_THREAD`, which the watcher exports
 into every turn, so an agent passes neither. Output goes to a log file, not into the
 agent's context; the message carries the path.
