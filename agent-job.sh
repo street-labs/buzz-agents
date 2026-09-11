@@ -75,10 +75,27 @@ job="$JOBS/$id.job"
 log="${log:-$JOBS/$id.log}"
 : > "$log"
 
+# The job gets its own session, not just nohup: a harness that kills its turn's whole
+# process group takes a merely-nohup'd child with it, which was observed twice. macOS
+# ships no setsid(1), so fall back to python3 - already a watcher dependency.
+# Backgrounding the detacher directly, rather than a subshell around it, is what makes
+# $! the pid that actually holds the job - which is what --check tests for liveness.
+#
 # The rc lands in its own file, never in the job file: the job file is written once and
 # moved into place, and a child appending to it would race that move.
-nohup bash -c 'log="$1"; rcf="$2"; shift 2; "$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"' \
-    _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+runner='log="$1"; rcf="$2"; shift 2; "$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"'
+detach='import os, sys
+try:
+    os.setsid()
+except OSError:
+    pass          # already a group leader, so already out of the caller group
+os.execvp(sys.argv[1], sys.argv[1:])'
+if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+else
+    python3 -c "$detach" bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+fi
+
 printf 'channel=%s\nthread=%s\nlabel=%s\nlog=%s\npid=%s\n' \
     "$channel" "$thread" "${label:-$1}" "$log" "$!" > "$job.tmp"
 mv "$job.tmp" "$job"   # only now is it visible to --check, pid included

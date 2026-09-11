@@ -63,4 +63,21 @@ sleep 1
 grep -q LOUD "$T/caller.out" && fail "job output leaked into the caller's output"
 grep -qr LOUD "$JOBS" || fail "job output did not reach the log"
 
+# 7. the job outlives a kill of the caller's whole process group. This is the failure
+#    that prompted the script: a harness that tears down a turn takes a merely-nohup'd
+#    child with it, and the build dies looking exactly like a build still running.
+echo "  (the Terminated: 15 below is this case killing its own process group, on purpose)"
+cat > "$T/launch.sh" <<INNER
+bash "$JOB" --label orphan -- sleep 8 >/dev/null
+sleep 1
+sed -n 's/^pid=//p' "\$(grep -l 'label=orphan' "$JOBS"/*.job)" > "$T/orphan.pid"
+kill -TERM -\$(ps -o pgid= -p \$\$ | tr -d '[:space:]')
+INNER
+( python3 -c 'import os,sys
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])' bash "$T/launch.sh" ) >/dev/null 2>&1
+sleep 1
+kill -0 "$(cat "$T/orphan.pid" 2>/dev/null)" 2>/dev/null || fail "job died with the caller's process group"
+pkill -f 'sleep 8' 2>/dev/null
+
 echo "PASS"; rm -rf "$T"
