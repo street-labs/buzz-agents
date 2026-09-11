@@ -65,6 +65,12 @@ HARNESS_ADAPTERS="${HARNESS_ADAPTERS:-$HOME/.buzz/agents/harness-adapters.sh}"
 
 # PPQ billing helpers: turn a silent 402 (drained balance) into a Buzz alert with a
 # top-up invoice instead of a dark agent. Optional - fall back to no-ops if absent.
+# Detached long jobs (builds, test suites). agent-job.sh records them on disk; the
+# poll loop below asks it once per cycle whether any has ended, so a build that
+# finishes - or dies - after the agent's turn still gets reported into the thread.
+AGENT_JOB="${AGENT_JOB:-$HOME/.buzz/agents/agent-job.sh}"
+export AGENT_NAME
+
 PPQ_BILLING="${PPQ_BILLING:-$HOME/.buzz/agents/ppq-billing.sh}"
 [ -f "$PPQ_BILLING" ] && . "$PPQ_BILLING"
 type ppq_output_is_402 >/dev/null 2>&1 || ppq_output_is_402() { return 1; }
@@ -999,6 +1005,7 @@ worker() {
   # Give the agent the concrete means to post progress updates mid-task (channel + root
   # + command). Only when directly asked to do something (not while just following).
   local POST_HINT=""
+  export BUZZ_CHANNEL="$channel_id" BUZZ_THREAD="$root_id"
   POST_HINT="
 
 ## Progress updates (this thread)
@@ -1006,7 +1013,12 @@ If this is a multi-step task (edits, build, tests, PR), keep the owner posted as
   buzz messages send --channel $channel_id --reply-to $root_id --content \"<one-line update>\"
 Good moments: understood the task, found the code, building, tests pass, pushing, opened PR (include the link). Keep each to one line. Do NOT post your final summary this way - whatever you print as your final message is posted to the thread automatically, so self-posting it would duplicate.
 
-Post at least one mid-work update for any task running more than ~2 minutes of tool activity. If you reach your final message without having posted one, you missed it. Quick answers (pure read + reply, no tool activity) are the exception - skip updates for those."
+Post at least one mid-work update for any task running more than ~2 minutes of tool activity. If you reach your final message without having posted one, you missed it. Quick answers (pure read + reply, no tool activity) are the exception - skip updates for those.
+
+## Long jobs (builds, test suites)
+Start anything slow with agent-job.sh and then END THE TURN. Do not sit in a polling loop - the loop dies when the turn does, and so does the only thing that would have told anyone the job finished.
+  $AGENT_JOB --label \"alpha build\" -- make ios-build
+It posts the exit code into this thread when the job ends, which re-summons you. If the job is killed without finishing, it posts that too."
 
   sid="$(get_session "$root_id")"
   work_dir="$(get_worktree "$root_id")"
@@ -1405,6 +1417,8 @@ echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} 
 
 while true; do
   spawned_roots=" "   # roots dispatched THIS poll cycle (space-delimited)
+  [ -x "$AGENT_JOB" ] && "$AGENT_JOB" --check
+
   # Wait if at max worker capacity
   while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do
     sleep 2
