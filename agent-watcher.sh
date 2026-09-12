@@ -1246,7 +1246,7 @@ import sys
 
 text = open(sys.argv[1]).read()
 actions = []
-pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact)(?::\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
+pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact|mute)(?::\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
 
 def replace(match):
     if not actions:
@@ -1257,7 +1257,10 @@ def replace(match):
     return ""
 
 clean = pattern.sub(replace, text).strip()
-if not clean:
+# A bare [[WATCHER: mute]] (nothing but the directive) is a deliberate silent turn:
+# the agent answers nothing and bows out. Keep the reply empty; only invent fallback
+# text when a fresh/compact directive consumed the whole reply by mistake.
+if not clean and any(a["action"] != "mute" for a in actions):
     clean = "Context lifecycle update scheduled."
 print(json.dumps({"reply": clean, "action": actions[0] if actions else None}))
 PY
@@ -1271,7 +1274,7 @@ PY
   # ran but produced no visible reply is almost always a silent model turn (deepseek
   # thinking-only turns, 2026-08-06). Nudge the same session once before falling back
   # to the "(no reply produced)" placeholder.
-  if { [ -z "$reply" ] || [ "$reply" = "null" ]; } && [ "${REPLY_GUARD:-1}" = "1" ]; then
+  if { [ -z "$reply" ] || [ "$reply" = "null" ]; } && [ "${REPLY_GUARD:-1}" = "1" ] && [ "$watcher_action" != "mute" ]; then
     echo "[$AGENT_NAME worker-$$] empty reply on $msg_id - re-prompting once (reply guard)"
     local retry_out retry_sid retry_pid retry_tpid eff_sid
     eff_sid="${new_sid:-$sid}"; [ "$on_fallback" = 1 ] && eff_sid=""
@@ -1289,9 +1292,24 @@ PY
     [ -n "$retry_sid" ] && [ "$on_fallback" = 0 ] && { new_sid="$retry_sid"; set_session "$root_id" "$new_sid"; }
   fi
 
-  [ -z "$reply" ] && reply="(no reply produced - check $STATE logs)"
+  [ -z "$reply" ] && [ "$watcher_action" != "mute" ] && reply="(no reply produced - check $STATE logs)"
 
   reply_target="$root_id"; [ -z "$reply_target" ] && reply_target="$msg_id"
+
+  # Agent chose to bow out without answering: post nothing, drop the thread from the
+  # watch list, and react 👋. An explicit @tag/p-tag later re-engages (and resumes the
+  # kept session). This is the agent-side counterpart of the owner's eject phrase.
+  if [ -z "$reply" ] && [ "$watcher_action" = "mute" ]; then
+    echo "[$AGENT_NAME worker-$$] silent bow-out on $msg_id - muting thread $root_id"
+    (
+      flock 200
+      grep -v "^$root_id" "$THREADS" > "$THREADS.ej" 2>/dev/null && mv "$THREADS.ej" "$THREADS" || true
+    ) 200>"$THREADS.lock"
+    "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+    "$BUZZ" reactions add --event "$reply_target" --emoji '👋' >/dev/null 2>&1 || true
+    rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
+    return 0
+  fi
 
   # Remove 👀 from thread root before posting final reaction
   "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
@@ -1322,6 +1340,14 @@ PY
         reset_thread_session "$root_id"
         mark_fresh_next "$root_id"
         echo "[$AGENT_NAME worker-$$] agent requested fresh next session for $root_id"
+        ;;
+      mute)
+        # Answered, then bowed out: stop watching this thread until re-tagged.
+        (
+          flock 200
+          grep -v "^$root_id" "$THREADS" > "$THREADS.ej" 2>/dev/null && mv "$THREADS.ej" "$THREADS" || true
+        ) 200>"$THREADS.lock"
+        echo "[$AGENT_NAME worker-$$] agent bowed out of thread $root_id (muted until re-tagged)"
         ;;
       compact)
         sid_for_compact="$new_sid"; [ -z "$sid_for_compact" ] && sid_for_compact="$sid"

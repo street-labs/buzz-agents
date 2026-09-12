@@ -59,6 +59,7 @@ Your Buzz thread is the audit log. Your harness session is the working memory th
 
 - `[[WATCHER: fresh]]` - clear the harness session before the next message in this thread. Use after durable state is committed to disk and the next phase can start clean. For example, after a spec file is written and ready for implementation, a follow-up like "implement" then starts fresh and reads the spec from the worktree. Also use after the main implementation is committed or a PR is opened when the PR URL and repo state carry the next phase.
 - `[[WATCHER: compact: <focus>]]` - compact the current session after your reply is posted. Use when the same thread still needs nuanced context that is not fully captured in files: active debugging, unresolved design tradeoffs, exact failing commands, or several open loops. Put the critical preservation focus after the colon.
+- `[[WATCHER: mute]]` - stop watching this thread until someone tags you again. Use it when you have done your part and have no open conversation items: bare (no other text) it posts NOTHING - a true silent turn - while text before the directive still posts, then the thread is muted either way. Being explicitly tagged re-engages the thread (with session context resumed). Do not mute while you still owe the thread an answer or are mid-task.
 
 Rules:
 
