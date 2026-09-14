@@ -306,7 +306,11 @@ for m in msgs:
     mid = m.get("id", ""); pub = m.get("pubkey", ""); c = (m.get("content", "") or "")
     if mid in seen:
         continue
-    ptags = [t[1] for t in m.get("tags", []) if len(t) >= 2 and t[0] == "p"]
+    # Never our own message. We are usually in our own peers file, so a reply
+    # that quotes "@name" would otherwise re-summon us once per reply.
+    if me and pub == me:
+        continue
+    ptags =[t[1] for t in m.get("tags", []) if len(t) >= 2 and t[0] == "p"]
     peer_ptags = [p for p in ptags if p in peers]
     # Multi-summon (2+ agents p-tagged) is allowed: each watcher independently
     # sees its own p-tag below (`explicitly`) and answers once. A former blanket
