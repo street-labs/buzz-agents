@@ -985,6 +985,19 @@ is_thread_resolved() {
 }
 
 # Worker: handle one message in the background (separate process)
+# Wait for $1, killing it if it outlives MODEL_TIMEOUT. The sleep runs as its own job so
+# the trap can kill it: killing only the timer subshell orphans the sleep, which holds the
+# worker's output pipe open and stalls the thread for the full timeout.
+wait_with_timeout() {  # $1=pid
+  local tpid
+  ( trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    sleep "$MODEL_TIMEOUT" & sp=$!; wait "$sp"
+    kill -TERM "$1" 2>/dev/null; sleep 3; kill -KILL "$1" 2>/dev/null ) &
+  tpid=$!
+  wait "$1" 2>/dev/null
+  kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
+}
+
 worker() {
   local msg_id="$1" channel_id="$2" content="$3" root_id="$4" threaded="$5" directly="$6" msgs="$7"
 
@@ -1214,12 +1227,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
 
   # Run agent with timeout using harness adapter
   invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
-
-  local gpid=$!
-  ( sleep "$MODEL_TIMEOUT"; kill -TERM "$gpid" 2>/dev/null; sleep 3; kill -KILL "$gpid" 2>/dev/null ) &
-  local tpid=$!
-  wait "$gpid" 2>/dev/null
-  kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
+  wait_with_timeout $!
 
   # Extract result and session using harness-aware extraction
   reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
@@ -1240,9 +1248,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
       out_file="$(mktemp)"
       echo "[$AGENT_NAME worker-$$] retrying on $turn_harness ($harness_model), bridge $(printf '%s' "$bridge" | wc -c | tr -d ' ') chars"
       invoke_harness "$turn_harness" "$out_file" "$(printf '%s\n\n---\n\n%s' "$bridge" "$prompt")" "$harness_model" "" "$work_dir" "$SYSTEM_PROMPT" &
-      gpid=$!
-      ( sleep "$MODEL_TIMEOUT"; kill -TERM "$gpid" 2>/dev/null; sleep 3; kill -KILL "$gpid" 2>/dev/null ) & tpid=$!
-      wait "$gpid" 2>/dev/null; kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
+      wait_with_timeout $!
       reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
       new_sid=""; on_fallback=1   # do not overwrite the primary's session id with the fallback's
       cost_data="$(extract_harness_field "$turn_harness" "$out_file" cost)"
@@ -1331,15 +1337,11 @@ PY
   # to the "(no reply produced)" placeholder.
   if { [ -z "$reply" ] || [ "$reply" = "null" ]; } && [ "${REPLY_GUARD:-1}" = "1" ] && [ "$watcher_action" != "mute" ]; then
     echo "[$AGENT_NAME worker-$$] empty reply on $msg_id - re-prompting once (reply guard)"
-    local retry_out retry_sid retry_pid retry_tpid eff_sid
+    local retry_out retry_sid eff_sid
     eff_sid="${new_sid:-$sid}"; [ "$on_fallback" = 1 ] && eff_sid=""
     retry_out="$(mktemp)"
     invoke_harness "$turn_harness" "$retry_out" "Your previous turn completed without posting any reply. The user is still waiting. Post your response now with the buzz CLI per your instructions. If you are blocked, say so plainly." "$harness_model" "$eff_sid" "$work_dir" "$SYSTEM_PROMPT" &
-    retry_pid=$!
-    ( sleep "$MODEL_TIMEOUT"; kill -TERM "$retry_pid" 2>/dev/null; sleep 3; kill -KILL "$retry_pid" 2>/dev/null ) &
-    retry_tpid=$!
-    wait "$retry_pid" 2>/dev/null
-    kill "$retry_tpid" 2>/dev/null; wait "$retry_tpid" 2>/dev/null
+    wait_with_timeout $!
     reply="$(extract_harness_field "$turn_harness" "$retry_out" result)"
     retry_sid="$(extract_harness_field "$turn_harness" "$retry_out" session_id)"
     rm -f "$retry_out"
