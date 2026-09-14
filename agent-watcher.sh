@@ -1487,7 +1487,9 @@ except: pass' "$boot_cutoff" >> "$SEEN"
   KNOWN="${KNOWN}${cid}
 "
 done
-"$BUZZ" users set-presence --status online >/dev/null 2>&1 || true
+set_presence() { "$BUZZ" users set-presence --status "$1" >/dev/null 2>&1 || true; }
+trap 'set_presence offline; exit 0' INT TERM
+set_presence online
 write_channel_map
 prune_worktrees
 echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} workers=0/$MAX_WORKERS channels=$(list_channel_ids | tr '\n' ' ')"
@@ -1544,5 +1546,6 @@ while true; do
     done < <(printf '%s' "$MSGS" | python3 -c "$FILTER" "$SEEN" "$OWNER" "$AGENT_NAME" "$THREADS" "$AGENT_PEERS_FILE" "$BOT_PUB" "$mo" "$AGENT_ASSIST_FILE" "${AGENT_THREAD_FOLLOW_PEERS:-}")
   done
 
+  set_presence online   # heartbeat: relay may treat presence as time-sensitive
   sleep 5
 done
