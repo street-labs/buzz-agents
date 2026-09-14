@@ -202,6 +202,13 @@ LASTTURN="$STATE/lastturn.tsv"; touch "$LASTTURN"  # root_id \t created_at of la
 FRESHNEXT="$STATE/freshnext.txt"; touch "$FRESHNEXT"  # roots whose next turn starts a fresh harness session
 CARRY="$STATE/carry"; mkdir -p "$CARRY"        # per-root compaction summaries seeded into the next turn
 LIMITED="$STATE/limited-until"                  # epoch until which the primary harness is rate-limited
+# Stall watch: threads the agent left mid-commitment. root_id \t channel_id \t
+# deadline_epoch \t attempts \t base64(last reply). The stall checker resumes the
+# session when the deadline lapses and escalates to the owner after MAX_STALL_RESUMES.
+STALL="$STATE/stall.tsv"; touch "$STALL"
+STALL_MARGIN="${STALL_MARGIN:-600}"            # grace after a declared/heuristic wait, seconds
+STALL_DEFAULT_WAIT="${STALL_DEFAULT_WAIT:-900}" # heuristic match with no declared wait, seconds
+MAX_STALL_RESUMES="${MAX_STALL_RESUMES:-2}"
 # name<TAB>id map of channels this bot can read, for cross-channel references
 # (#name or buzz:// links). Inherited by the Claude subprocess via the env.
 export BUZZ_CHANNELS_TSV="$STATE/channels.tsv"; touch "$BUZZ_CHANNELS_TSV"
@@ -984,6 +991,88 @@ is_thread_resolved() {
   echo "$reply" | grep -qiE '(github\.com/[^/]+/[^/]+/pull/[0-9]+|^Done\.|Pushed to|PR #[0-9]+|Merged|✅.*complete)'
 }
 
+stall_is_open_ended() {  # $1 = reply text
+  local reply="$1" last
+  last="$(printf '%s' "$reply" | grep -v '^[[:space:]]*$' | tail -1)"
+  [ -n "$last" ] || return 1
+  printf '%s' "$last" | grep -qiE "(${STALL_ENDWORDS})[.!,:]?[[:space:]]*$"
+}
+
+stall_delete() {  # $1 = root_id
+  (
+    flock 200
+    grep -v "^$1$(printf '\t')" "$STALL" > "$STALL.tmp" 2>/dev/null || true
+    mv "$STALL.tmp" "$STALL"
+  ) 200>"$STALL.lock"
+}
+
+# Called by the worker after a successful post. Keeps the thread on the stall watch
+# if the reply is open-ended (declared wait or heuristic), records the deadline, and
+# drops the watch for resolved or normally finished threads.
+stall_watch_record() {  # $1=root $2=channel $3=reply $4=declared_wait_secs
+  local root="$1" cid="$2" reply="$3" wsecs="${4:-0}" now deadline attempts b64
+  now="$(date +%s)"
+  if is_thread_resolved "$reply" || { ! stall_is_open_ended "$reply" && [ "$wsecs" -eq 0 ]; }; then
+    stall_delete "$root"
+    return
+  fi
+  [ "$wsecs" -gt 0 ] || wsecs="$STALL_DEFAULT_WAIT"
+  deadline=$((now + wsecs + STALL_MARGIN))
+  attempts="$(awk -F'\t' -v r="$root" '$1==r{print $4}' "$STALL")"
+  attempts="${attempts:-0}"
+  b64="$(printf '%s' "$reply" | base64 | tr -d '\n')"
+  (
+    flock 200
+    grep -v "^$root$(printf '\t')" "$STALL" > "$STALL.tmp" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$root" "$cid" "$deadline" "$attempts" "$b64" >> "$STALL.tmp"
+    mv "$STALL.tmp" "$STALL"
+  ) 200>"$STALL.lock"
+  echo "[$AGENT_NAME worker-$$] stall watch armed for $root until $(date -r "$deadline" +%H:%M) (attempts=$attempts)"
+}
+
+# Main-loop pass: resume threads whose deadline lapsed; escalate to the owner after
+# MAX_STALL_RESUMES failed resumes. The resume reuses the worker machinery, so the
+# same harness session picks the thread back up (proven by the 2026-10-15 hand-written
+# resumes for coffee-shop and keeper).
+stall_check() {
+  local now root cid deadline attempts b64 reply excerpt mid
+  now="$(date +%s)"
+  while IFS=$'\t' read -r root cid deadline attempts b64; do
+    [ -n "$root" ] || continue
+    [ "$deadline" -gt "$now" ] && continue
+    # A live worker on this thread (a real mention, or a resume in flight) owns it.
+    if [ -f "$WORKERS/root-$root.pid" ] && kill -0 "$(cat "$WORKERS/root-$root.pid" 2>/dev/null)" 2>/dev/null; then continue; fi
+    attempts=$((attempts + 1))
+    reply="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
+    excerpt="$(printf '%s' "$reply" | tail -c 300 | tr '\n' ' ')"
+    if [ "$attempts" -gt "$MAX_STALL_RESUMES" ]; then
+      echo "[$AGENT_NAME] stall escalate $root after $MAX_STALL_RESUMES failed resumes"
+      "$BUZZ" messages send --channel "$cid" --reply-to "$root" --mention "$OWNER" --content "Stall alert (watcher): $AGENT_NAME went silent mid-task and $MAX_STALL_RESUMES auto-resume attempts did not produce a follow-up. Last message ended: \"...$excerpt\" - human attention needed." >/dev/null 2>&1 \
+        || echo "[$AGENT_NAME] stall escalation post failed for $root"
+      stall_delete "$root"
+      continue
+    fi
+    mid="stall-resume-$root-$attempts-$now"
+    worker "$mid" "$cid" "Auto-resume (watcher): your last message ended mid-task and you have been silent past your declared wait. Your last message ended: \"...$excerpt\" Pick up exactly where you left off: verify current state (files, git log, build output), finish the work, and post the result. If the work is actually done or you are blocked, say so plainly." "$root" 1 1 '[]' &
+    echo $! > "$WORKERS/root-$root.pid"
+    # Push the deadline out so a still-running resume does not refire each poll;
+    # the worker's own stall_watch_record rewrites it on completion.
+    (
+      flock 200
+      deadline=$((now + STALL_MARGIN))
+      grep -v "^$root$(printf '\t')" "$STALL" > "$STALL.tmp" 2>/dev/null || true
+      printf '%s\t%s\t%s\t%s\t%s\n' "$root" "$cid" "$deadline" "$attempts" "$b64" >> "$STALL.tmp"
+      mv "$STALL.tmp" "$STALL"
+    ) 200>"$STALL.lock"
+    echo "[$AGENT_NAME] stall resume #$attempts spawned for $root"
+  done < <(cat "$STALL" 2>/dev/null)
+}
+
+# Does this reply read as "work in progress, more coming"? Returns 0 if open-ended,
+# 1 if a normal finished turn. Matches only the LAST non-empty line, so a closing
+# summary that merely mentions "next steps" mid-message does not trip it.
+STALL_ENDWORDS="${STALL_ENDWORDS:-then|next|will|building|running|testing|deploying|pushing|waiting|compiling|installing|implementing|rebuilding|working|shortly|back|standby|stay tuned|hang tight|report back|in (a )?few minutes|in ~?[0-9]+ ?min}"
+
 # Worker: handle one message in the background (separate process)
 # Wait for $1, killing it if it outlives MODEL_TIMEOUT. The sleep runs as its own job so
 # the trap can kill it: killing only the timer subshell orphans the sleep, which holds the
@@ -1307,7 +1396,7 @@ import sys
 
 text = open(sys.argv[1]).read()
 actions = []
-pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact|mute)(?::\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
+pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact|mute|wait)(?::\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
 
 def replace(match):
     if not actions:
@@ -1329,6 +1418,17 @@ PY
     watcher_action="$(python3 -c 'import sys,json; a=json.load(open(sys.argv[1])).get("action") or {}; print(a.get("action", ""))' "$parsed_json" 2>/dev/null || true)"
     watcher_action_instructions="$(python3 -c 'import sys,json; a=json.load(open(sys.argv[1])).get("action") or {}; print(a.get("instructions", ""))' "$parsed_json" 2>/dev/null || true)"
     rm -f "$reply_in" "$parsed_json"
+    # [[WATCHER: wait ~20m reason]] = machine-readable bounded-wait declaration.
+    stall_wait_secs=0
+    if [ "$watcher_action" = "wait" ]; then
+      wn="$(printf '%s' "$watcher_action_instructions" | grep -oE '[0-9]+' | head -1)"
+      case "$watcher_action_instructions" in
+        *h*) stall_wait_secs=$(( ${wn:-0} * 3600 )) ;;
+        *m*) stall_wait_secs=$(( ${wn:-0} * 60 )) ;;
+        *)   stall_wait_secs="$STALL_DEFAULT_WAIT" ;;
+      esac
+      [ "$stall_wait_secs" -gt 0 ] || stall_wait_secs="$STALL_DEFAULT_WAIT"
+    fi
   fi
 
   # Reply guard (mirrors upstream buzz-agent's BUZZ_AGENT_REQUIRE_REPLY): a turn that
@@ -1375,7 +1475,17 @@ PY
   # into a variable is the only way to learn why a post was rejected. Discarding it
   # made "post failed" unexplainable (2026-09-02).
   local send_out send_rc
-  send_out="$("$BUZZ" messages send --channel "$channel_id" --reply-to "$reply_target" --content "$reply" 2>&1)"
+  # Relay rejects any @token that does not resolve to a channel member (introduced by
+  # the 2026-09-12 relay upgrade). Pass roster pubkeys explicitly so the @Name text in
+  # replies (e.g. a builder ping) is presentation-only instead of a hard failure.
+  local -a mention_flags=()
+  local m_pub m_name
+  if [ -f "$AGENT_ROSTER_FILE" ]; then
+    while IFS=$'\t' read -r m_pub m_name; do
+      [[ "$reply" == *"@$m_name"* ]] && mention_flags+=("--mention" "$m_pub")
+    done < <(awk -F'\t' 'NF>=2{print $1"\t"$2}' "$AGENT_ROSTER_FILE")
+  fi
+  send_out="$("$BUZZ" messages send --channel "$channel_id" --reply-to "$reply_target" --content "$reply" ${mention_flags[@]+"${mention_flags[@]}"} 2>&1)"
   send_rc=$?
   if [ "$send_rc" -eq 0 ]; then
     # (msg_id was already marked seen at worker start, above.) Record our thread role
@@ -1434,6 +1544,10 @@ PY
       "$BUZZ" reactions add --event "$reply_target" --emoji '💬' >/dev/null 2>&1 || true
       echo "[$AGENT_NAME worker-$$] completed $msg_id (waiting)"
     fi
+
+    # Arm (or clear) the stall watch based on how this turn ended. A bare mute
+    # (silent bow-out) never reaches here, so muted threads are not stall-watched.
+    stall_watch_record "$root_id" "$channel_id" "$reply" "${stall_wait_secs:-0}"
 
     # Cost reaction (cumulative cents) if the harness reported cost this turn.
     # Remove the previous cost reaction before adding the updated one so only the
@@ -1500,6 +1614,7 @@ echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} 
 
 while true; do
   spawned_roots=" "   # roots dispatched THIS poll cycle (space-delimited)
+  stall_check
   [ -x "$AGENT_JOB" ] && "$AGENT_JOB" --check
 
   # Wait if at max worker capacity
