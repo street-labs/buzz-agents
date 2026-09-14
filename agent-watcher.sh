@@ -142,25 +142,9 @@ command -v flock >/dev/null 2>&1 || echo "[$AGENT_NAME] WARNING: 'flock' not fou
 # spawned in one second; quadruple replies to every mention), and manual launches in
 # tmux bypass the launcher entirely. flock is NOT usable here: homebrew flock 0.4.0
 # on macOS does not enforce `flock -n <fd>` exclusion (see note above), so we use an
-# atomic mkdir mutex with PID-liveness for stale-lock recovery. A second instance
-# exits immediately instead of double-replying.
-_single_dir="${AGENTS_DIR:-$HOME/.buzz/agents}/$AGENT_NAME/.watcher.lock"
-_single_try() { mkdir "$_single_dir" 2>/dev/null && { echo $$ > "$_single_dir/pid"; return 0; }; return 1; }
-if ! _single_try; then
-  _single_pid=$(cat "$_single_dir/pid" 2>/dev/null || true)
-  if [ -n "$_single_pid" ] && kill -0 "$_single_pid" 2>/dev/null; then
-    echo "[$AGENT_NAME] watcher already running (pid $_single_pid) - refusing to start a duplicate" >&2
-    exit 0
-  fi
-  # Stale lock from a crashed/killed watcher - reclaim once. If we lose the reclaim
-  # race to a peer, bow out; it is the live one.
-  rm -rf "$_single_dir"
-  if ! _single_try; then
-    echo "[$AGENT_NAME] lost stale-lock reclaim race - refusing to start a duplicate" >&2
-    exit 0
-  fi
-fi
-trap 'rm -rf "$_single_dir"' EXIT
+# atomic mkdir mutex with PID-liveness for stale-lock recovery - it lives below,
+# anchored to the fixed $STATE dir (see "Second singleton guard"). A second
+# instance exits immediately instead of double-replying.
 
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 export BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-http://localhost:3000}"
@@ -170,6 +154,29 @@ export OWNER="${OWNER:?Set OWNER to the human owner hex pubkey (nak key public <
 BOT_PUB="$(nak key public "$(cat "$AGENT_KEY_FILE")" 2>/dev/null)"
 
 STATE="$HOME/.buzz/agents/$AGENT_NAME"; mkdir -p "$STATE"
+
+# Second singleton guard (macOS flock(1) does not enforce fd locks, so this is
+# the effective one): anchor the mkdir mutex to the FIXED state dir, not
+# AGENTS_DIR. production had 3 watchers for one env because each was launched
+# with a different AGENTS_DIR (worktree slots), giving each its own mutex path,
+# while the flock below never excluded any of them. Moved here so $STATE exists.
+_single_dir="$STATE/.watcher.lock"
+_single_try() { mkdir "$_single_dir" 2>/dev/null && { echo $$ > "$_single_dir/pid"; return 0; }; return 1; }
+if ! _single_try; then
+  _single_pid=$(cat "$_single_dir/pid" 2>/dev/null || true)
+  if [ -n "$_single_pid" ] && kill -0 "$_single_pid" 2>/dev/null; then
+    echo "[$AGENT_NAME] watcher already running (pid $_single_pid) - refusing to start a duplicate" >&2
+    exit 0
+  fi
+  # Stale lock from a crashed/killed watcher - reclaim once. If we lose the
+  # reclaim race to a peer, bow out; it is the live one.
+  rm -rf "$_single_dir"
+  if ! _single_try; then
+    echo "[$AGENT_NAME] lost stale-lock reclaim race - refusing to start a duplicate" >&2
+    exit 0
+  fi
+fi
+trap 'rm -rf "$_single_dir"' EXIT
 
 # Singleton guard: one watcher per agent. A second copy (duplicate tmux session,
 # relaunch before the old one died) takes the lock non-blocking and exits instead
@@ -759,16 +766,59 @@ slot_is_stale() {
   [ -z "$recent" ]
 }
 
+# Atomically claim $slot for $root: under one flock, verify no row claims the
+# path and write a placeholder row. The TOCTOU bug this fixes: claim_free_slot
+# used to lock only the grep, while set_worktree wrote the row much later (after
+# fetch/reset), so two watchers in the same poll cycle both passed the free-check
+# and got the same slot, then clobbered each other's harness edits in one tree.
+reserve_slot() {
+  local slot="$1" root="$2" tmp; tmp="$(mktemp)"
+  (
+    flock 200
+    grep -qF "	$slot	" "$WORKTREES" && exit 1
+    awk -F'\t' -v r="$root" '$1!=r' "$WORKTREES" > "$tmp" 2>/dev/null || true
+    printf '%s	%s	reserving	\n' "$root" "$slot" >> "$tmp"
+    mv "$tmp" "$WORKTREES"
+  ) 200>"$WORKTREES.lock"
+}
+
+# Atomically pick and reserve a fresh slot path: the [ -e ] scan plus the
+# worktrees.tsv row happen under one flock, so two concurrent watchers cannot
+# both pick the same unused slot-n and race their git worktree add.
+claim_new_slot() {  # base_dir root -> path
+  local base_dir="$1" root="$2" n=0 p tmp
+  (
+    flock 200
+    while [ -e "$base_dir/$AGENT_NAME-slot-$n" ] ||
+          grep -qF "	$base_dir/$AGENT_NAME-slot-$n	" "$WORKTREES"; do n=$((n + 1)); done
+    p="$base_dir/$AGENT_NAME-slot-$n"
+    tmp="$(mktemp)"
+    awk -F'\t' -v r="$root" '$1!=r' "$WORKTREES" > "$tmp" 2>/dev/null || true
+    printf '%s	%s	reserving	\n' "$root" "$p" >> "$tmp"
+    mv "$tmp" "$WORKTREES"
+    echo "$p"
+  ) 200>"$WORKTREES.lock"
+}
+
+del_worktree() {  # drop a root's row (releases a reservation the caller abandons)
+  local tmp; tmp="$(mktemp)"
+  (
+    flock 200
+    awk -F'\t' -v r="$1" '$1!=r' "$WORKTREES" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$WORKTREES"
+  ) 200>"$WORKTREES.lock"
+}
+
 claim_free_slot() {
-  local base_dir="$1" slot stale_candidate=""
+  local base_dir="$1" root="$2" slot stale_candidate=""
   for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     [ -d "$slot" ] || continue
-    flock "$WORKTREES" grep -qF "	$slot	" "$WORKTREES" && continue
+    grep -qF "	$slot	" "$WORKTREES" && continue  # fast path; reserve_slot is the real gate
 
     if [ -z "$(git -C "$slot" status --porcelain 2>/dev/null)" ] &&
        [ -z "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ]; then
-      echo "$slot"
-      return 0
+      reserve_slot "$slot" "$root" && { echo "$slot"; return 0; }
+      continue  # lost the reserve race to a concurrent watcher
     fi
 
     # Holds work. Usable only once it has gone quiet, and preferred least.
@@ -776,6 +826,7 @@ claim_free_slot() {
   done
 
   [ -n "$stale_candidate" ] || return 1
+  reserve_slot "$stale_candidate" "$root" || return 1
 
   # Park uncommitted work on the branch so reusing the path cannot lose it.
   if [ -n "$(git -C "$stale_candidate" status --porcelain 2>/dev/null)" ]; then
@@ -800,7 +851,7 @@ create_worktree() {
   [ -n "$existing" ] && [ -d "$existing" ] && { echo "$existing"; return 0; }
   [ -d "$base_dir/$short_id" ] && { echo "$base_dir/$short_id"; return 0; }
 
-  if wt_path="$(claim_free_slot "$base_dir")"; then
+  if wt_path="$(claim_free_slot "$base_dir" "$root")"; then
     old_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "")"
     # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
     # output, which is the entire point of recycling the slot.
@@ -814,6 +865,7 @@ create_worktree() {
            git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" clean -fd >/dev/null 2>&1 ); then
       echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
+      del_worktree "$root"  # release the reservation; the slot did not get reset
       wt_path=""
     else
       # Only drop the old branch if it holds nothing a remote does not already
@@ -831,15 +883,14 @@ create_worktree() {
   # No free slot, or the reset failed. Cut a new slot rather than block: running
   # out of slots must never stop a new thread from starting work.
   if [ -z "$wt_path" ]; then
-    n=0
-    while [ -e "$base_dir/$AGENT_NAME-slot-$n" ]; do n=$((n + 1)); done
-    wt_path="$base_dir/$AGENT_NAME-slot-$n"
+    wt_path="$(claim_new_slot "$base_dir" "$root")"
     # -b fails if the branch already exists, which is what a thread whose worktree
     # was deleted out from under it hits: the branch outlives the directory. Attach
     # the existing branch rather than falling through to the main repo.
     ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
       { git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 || \
         git worktree add "$wt_path" "$branch" >/dev/null 2>&1; } ) || {
+      del_worktree "$root"  # release the reservation the add did not consume
       echo "[$AGENT_NAME] worktree creation failed for $root" >&2
       echo "$AGENT_REPO"
       return 1
