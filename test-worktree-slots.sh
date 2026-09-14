@@ -26,7 +26,7 @@ set_worktree() {
   ) 200>"$WORKTREES.lock"
 }
 # functions under test, extracted verbatim
-eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^reserve_slot() {/,/^}/p;/^claim_new_slot() {/,/^}/p;/^del_worktree() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
 eval "$(sed -n '/^create_worktree() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
@@ -103,5 +103,17 @@ w10=$(create_worktree $r2 2>/dev/null)
 [ -d "$w10" ] || fail "handed back a path that does not exist: $w10"
 [ "$(get_worktree $r2)" = "$w10" ] || fail "row not repointed at the live worktree"
 echo "ok: deleted worktree replaced with a live one ($w10)"
+
+# Concurrency: two watchers claiming in the same poll cycle must get different
+# slots. This is the TOCTOU that put two roots onto coffee-shop-slot-6 at once.
+rA=aaa1bbbb; rB=bbb2cccc
+create_worktree $rA >/dev/null 2>&1 & p1=$!
+create_worktree $rB >/dev/null 2>&1 & p2=$!
+wait $p1 $p2
+a="$(get_worktree $rA)"; b="$(get_worktree $rB)"
+[ -n "$a" ] && [ -n "$b" ] || fail "concurrent claims returned empty ($a / $b)"
+[ -d "$a" ] && [ -d "$b" ] || fail "concurrent claims handed back non-directories ($a / $b)"
+[ "$a" != "$b" ] || fail "concurrent claims got the same slot: $a"
+echo "ok: concurrent claims got distinct slots ($a / $b)"
 
 echo "ALL PASS"
