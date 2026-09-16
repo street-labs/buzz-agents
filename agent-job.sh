@@ -9,7 +9,8 @@
 #
 # So the job is recorded on disk instead of in a live shell. The watcher polls with
 # --check once per cycle and posts the outcome into the thread, which re-summons the
-# agent: the message @-mentions it, and an agent's own key is in peers.txt.
+# agent: the message @-mentions it, and the watcher's own-message filter lets this one
+# post through (every other message under the agent's own key is dropped).
 #
 #   agent-job.sh --label "alpha build" -- make ios-build
 #   agent-job.sh --check          # the watcher, once per poll cycle
