@@ -314,8 +314,11 @@ for m in msgs:
     if mid in seen:
         continue
     # Never our own message. We are usually in our own peers file, so a reply
-    # that quotes "@name" would otherwise re-summon us once per reply.
-    if me and pub == me:
+    # that quotes "@name" would otherwise re-summon us once per reply. The one
+    # exception is agent-job.sh reporting a job outcome under our key: that post is
+    # written by the script, not a model reply, and it is what wakes us.
+    job_post = c.startswith("@" + name + ' job "') and ("finished rc=" in c or "stopped without a verdict" in c)
+    if me and pub == me and not job_post:
         continue
     ptags =[t[1] for t in m.get("tags", []) if len(t) >= 2 and t[0] == "p"]
     peer_ptags = [p for p in ptags if p in peers]
