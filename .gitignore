@@ -2,3 +2,4 @@
 .DS_Store
 *.env
 !example.env
+decisions-pending.md

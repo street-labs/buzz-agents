@@ -1,0 +1,1 @@
+@.pdeq/engineering/AGENTS.md

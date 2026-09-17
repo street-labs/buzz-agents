@@ -1,0 +1,3 @@
+[submodule ".pdeq"]
+	path = .pdeq
+	url = https://github.com/ldstreet/pdeq.git
