@@ -1153,6 +1153,9 @@ worker() {
   # 👀 = actively working (set on thread root, removed before posting reply)
   reaction_target="$root_id"; [ -z "$reaction_target" ] && reaction_target="$msg_id"
   "$BUZZ" reactions add --event "$reaction_target" --emoji '👀' >/dev/null 2>&1 || true
+  # Clear any ⏳ from a previous wait-directive turn: a worker starting on this
+  # thread (new message or stall auto-resume) means the wait is over.
+  "$BUZZ" reactions remove --event "$reaction_target" --emoji '⏳' >/dev/null 2>&1 || true
 
   # When only following a thread (not directly addressed), let the agent stay silent
   # by replying [[SKIP]] (suppressed below).
@@ -1466,6 +1469,7 @@ PY
       grep -v "^$root_id" "$THREADS" > "$THREADS.ej" 2>/dev/null && mv "$THREADS.ej" "$THREADS" || true
     ) 200>"$THREADS.lock"
     "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+    "$BUZZ" reactions remove --event "$reply_target" --emoji '⏳' >/dev/null 2>&1 || true
     "$BUZZ" reactions add --event "$reply_target" --emoji '👋' >/dev/null 2>&1 || true
     rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
     return 0
@@ -1473,6 +1477,7 @@ PY
 
   # Remove 👀 from thread root before posting final reaction
   "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+  "$BUZZ" reactions remove --event "$reply_target" --emoji '⏳' >/dev/null 2>&1 || true
 
   # Capture both streams: the CLI reports failures as JSON on stdout, so redirecting
   # into a variable is the only way to learn why a post was rejected. Discarding it
@@ -1545,7 +1550,11 @@ PY
     else
       # 💬 = waiting for your response (agent finished turn, thread still open)
       "$BUZZ" reactions add --event "$reply_target" --emoji '💬' >/dev/null 2>&1 || true
-      echo "[$AGENT_NAME worker-$$] completed $msg_id (waiting)"
+      # ⏳ = the turn ended with a [[WATCHER: wait]] directive: agent declared a
+      # bounded wait on an in-progress task, so mark it visibly as waiting-on-task.
+      [ "$watcher_action" = "wait" ] \
+        && "$BUZZ" reactions add --event "$reply_target" --emoji '⏳' >/dev/null 2>&1 || true
+      echo "[$AGENT_NAME worker-$$] completed $msg_id (waiting${watcher_action:+, action=$watcher_action})"
     fi
 
     # Arm (or clear) the stall watch based on how this turn ended. A bare mute
