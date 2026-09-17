@@ -3,6 +3,7 @@
 # "@name" used to re-summon it, once per reply. Run: bash test-filter-self.sh
 set -u
 cd "$(dirname "$0")"
+bash -n agent-watcher.sh || { echo "FAIL: agent-watcher.sh does not parse"; exit 1; }
 T=$(mktemp -d)
 FILTER="$(python3 -c '
 import re,sys
