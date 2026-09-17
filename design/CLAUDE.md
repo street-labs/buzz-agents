@@ -1,0 +1,1 @@
+@.pdeq/design/AGENTS.md

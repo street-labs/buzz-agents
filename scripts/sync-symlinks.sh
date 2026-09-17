@@ -1,0 +1,1 @@
+../.pdeq/scripts/sync-symlinks.sh
