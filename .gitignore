@@ -3,3 +3,5 @@
 *.env
 !example.env
 decisions-pending.md
+__pycache__/
+*.pyc

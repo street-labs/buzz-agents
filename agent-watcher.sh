@@ -430,6 +430,11 @@ recent_msgs = json.loads(lines[1]) if len(lines) > 1 and lines[1] else []
 current = json.loads(lines[2]) if len(lines) > 2 and lines[2] else {}
 cid = current.get("id",""); parts = []
 since = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 0
+notes = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
+if notes:
+    # Salon blackboard: shared scratch decisions visible to every participant
+    # (FR-salon-arbiter-reads-blackboard / late-joiner catch-up).
+    parts.append("## Shared scratch notes (salon blackboard, newest last)\n" + notes)
 if thread_msgs:
     if since > 0:
         # Resumed session: only messages that arrived AFTER the last turn we answered.
