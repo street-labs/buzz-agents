@@ -1,0 +1,1 @@
+../../.pdeq/pdeq-rules/commands/pdeq-conform.md

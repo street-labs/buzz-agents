@@ -1,0 +1,1 @@
+@.pdeq/product/AGENTS.md
