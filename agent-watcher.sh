@@ -129,6 +129,11 @@ AGENT_MENTION_ONLY_FILE="${AGENT_MENTION_ONLY_FILE:-}"
 AGENT_ASSIST_FILE="${AGENT_ASSIST_FILE:-$HOME/.buzz/agents/assist.txt}"
 AGENT_PEERS_FILE="${AGENT_PEERS_FILE:-$HOME/.buzz/agents/peers.txt}"
 MODEL_TIMEOUT="${MODEL_TIMEOUT:-600}"
+
+# Opt-in Jev triage (TypeSafe System One): drop high-confidence "ignore" noise
+# before spawning a worker. Off by default; any failure (no key, network error,
+# low confidence) = no verdict = behave exactly as today. See jev-triage.py.
+JEV_TRIAGE_SCRIPT="${JEV_TRIAGE_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/jev-triage.py}"
 AMBIENT_COUNT="${AMBIENT_COUNT:-8}"
 MAX_WORKERS="${MAX_WORKERS:-8}"  # max concurrent claude sessions
 BOOT_GRACE="${BOOT_GRACE_SECONDS:-600}"  # on boot, only suppress history OLDER than this; recent unanswered mentions survive a restart
@@ -1668,6 +1673,21 @@ while true; do
       done
 
       content="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
+
+      # Opt-in Jev triage: a printed verdict = high-confidence "ignore" -> mark
+      # seen and skip. Empty output (flag off, no key, error, low confidence)
+      # = fall through to normal behavior. Jev is an accelerant, never a dependency.
+      if [ "${AGENT_JEV_TRIAGE:-0}" = "1" ] && [ -f "$JEV_TRIAGE_SCRIPT" ]; then
+        tv="$(python3 "$JEV_TRIAGE_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" 2>/dev/null)"
+        if [ -n "$tv" ]; then
+          echo "[$AGENT_NAME] jev triage ignored $msg_id: $tv"
+          (
+            flock 200
+            echo "$id" >> "$SEEN"
+          ) 200>"$SEEN.lock"
+          continue
+        fi
+      fi
 
       # Spawn worker in background; record its pid as the per-thread lock
       worker "$id" "$cid" "$content" "$root_id" "$threaded" "$directly" "$MSGS" &
