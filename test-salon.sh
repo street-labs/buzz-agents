@@ -43,4 +43,30 @@ base="$(git show c93671f:agent-watcher.sh | sed -n "/^FILTER='/,/^'$/p")"
 cur="$(sed -n "/^FILTER='/,/^'$/p" agent-watcher.sh)"
 [ "$base" = "$cur" ] || fail "FILTER changed - flag-off equivalence broken"
 
+# 4. Send gate unit tests (ENG-salon-tests): direct questions never dropped;
+# malformed/absent gate verdict fails open (posts unchanged).
+python3 - <<'PY' || fail "send-gate unit"
+import importlib.util as u
+spec = u.spec_from_file_location("sa", "salon-arbiter.py"); m = u.module_from_spec(spec); spec.loader.exec_module(m)
+
+def gate(answ=0.9, worth=0.1):
+    return {"answers": {"answered_elsewhere": {"noul": answ},
+                        "still_worth_sending": {"noul": worth}}}
+
+assert m.gate_verdict(gate(), False) == {"outcome": "drop"}, "answered elsewhere + redundant -> drop"
+assert m.gate_verdict(gate(), True) is None, "direct ask must NEVER be dropped"
+assert m.gate_verdict(gate(answ=0.5), False) is None, "low answered_elsewhere -> send"
+assert m.gate_verdict(gate(worth=0.6), False) is None, "still adds value -> send"
+assert m.gate_verdict({"answers": {"garbage": 1}}, False) is None, "malformed -> fail open"
+assert m.gate_verdict(None, False) is None, "no data -> fail open"
+print("send-gate unit ok")
+PY
+
+# 5. Watcher gate wiring: direct asks skip the gate entirely, and an empty
+# gate verdict falls through to posting (fail-open at the call site).
+GATE_BLOCK="$(sed -n '/Salon send gate (FR-salon-send-gate)/,/^  fi$/p' agent-watcher.sh)"
+[ -n "$GATE_BLOCK" ] || fail "send gate block not found"
+[[ "$GATE_BLOCK" == *'"$directly" != "1"'* ]] || fail "direct asks must bypass the gate"
+[[ "$GATE_BLOCK" == *'if [ -n "$gv" ]'* ]] || fail "empty gate verdict must fail open (only drop when gv non-empty)"
+
 echo "salon: all tests passed"
