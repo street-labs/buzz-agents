@@ -86,6 +86,13 @@ Notable knobs:
   then bows out). New channels are summon-only by default.
 - `AGENT_PERSONA_FILE`: extra prompt text appended after the base prompt.
 - `MAX_WORKERS`, `MODEL_TIMEOUT`, `BOOT_GRACE`: concurrency and timing.
+- `AGENT_JEV_TRIAGE=1` (default off): opt-in Jev message triage via the TypeSafe
+  System One API. Before spawning a worker, one ~300ms Jev call routes the message
+  (act vs ignore) with urgency/complexity scores. A high-confidence `ignore`
+  (route confidence >= `JEV_CONF_MIN`, default 0.8) skips the message; anything
+  else - flag off, missing key (`TYPESAFE_API_KEY` or `~/.typesafe/key`), API
+  error, or low confidence - falls back to the existing behavior. Requires no
+  SDK; see `jev-triage.py`.
 
 ## Worktree slots
 
