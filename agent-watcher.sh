@@ -148,6 +148,7 @@ SALON_SPEAK_MIN="${SALON_SPEAK_MIN:-0.8}"
 SALON_CONF_MIN="${SALON_CONF_MIN:-0.8}"
 SALON_TAP_PREFIX="${SALON_TAP_PREFIX:-[salon tap]}"
 SALON_ARBITER_SCRIPT="${SALON_ARBITER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/salon-arbiter.py}"
+SALON_LLM_RUNG="${SALON_LLM_RUNG:-1}"   # fall back to a one-shot harness call when Jev is unavailable
 is_salon_channel() {  # $1=channel id
   case " $AGENT_SALON_CHANNELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -1117,6 +1118,7 @@ worker() {
 
   # Mark worker as running
   echo $$ > "$WORKERS/$msg_id.pid"
+  turn_t0="$(date +%s)"
 
   # Eject: owner directly tells us to leave -> drop the thread + session and go silent
   # (just a 👋). Prevents an agent from lingering/meddling in a thread it was told off.
@@ -1486,9 +1488,37 @@ PY
 
   reply_target="$root_id"; [ -z "$reply_target" ] && reply_target="$msg_id"
 
-  # Agent chose to bow out without answering: post nothing, drop the thread from the
-  # watch list, and react 👋. An explicit @tag/p-tag later re-engages (and resumes the
-  # kept session). This is the agent-side counterpart of the owner's eject phrase.
+  # Salon send gate (FR-salon-send-gate): slow turns or turns where new thread
+  # messages arrived while composing get one Jev check. Fail-open: any problem
+  # (no key, error, low confidence) posts unchanged. Direct asks are never
+  # dropped (FR-salon-no-ghosting); drop = quiet, with a blackboard record.
+  if [ -n "$AGENT_SALON_CHANNELS" ] && is_salon_channel "$channel_id" && [ "$directly" != "1" ]; then
+    turn_secs=$(( $(date +%s) - ${turn_t0:-0} ))
+    new_since_start=0
+    if [ -n "$THREAD_JSON" ] && [ "$THREAD_JSON" != "[]" ]; then
+      new_since_start="$(printf '%s' "$THREAD_JSON" | python3 -c '
+import sys, json
+try:
+    t0 = int(sys.argv[1])
+    print(sum(1 for m in json.load(sys.stdin) if m.get("created_at", 0) > t0))
+except Exception:
+    print(0)
+' "${turn_t0:-0}" 2>/dev/null)"
+    fi
+    if [ "$turn_secs" -ge "${SALON_GATE_MIN_SECS:-30}" ] || [ "${new_since_start:-0}" -gt 0 ]; then
+      gv="$(python3 "$SALON_ARBITER_SCRIPT" --gate "$(printf '%s' "$reply" | head -c 2000)" "$(printf '%s' "$THREAD_JSON" | head -c 6000)" 2>/dev/null)"
+      if [ -n "$gv" ]; then
+        echo "[$AGENT_NAME salon] send gate dropped reply for $msg_id: $gv"
+        "$BUZZ" messages send --channel "$AGENT_SALON_BLACKBOARD" \
+          --content "$SALON_TAP_PREFIX dropped-reply salon=$channel_id root=$root_id trigger=$msg_id draft: $(printf '%s' "$reply" | head -c 400)" \
+          >/dev/null 2>&1 || true
+        "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+        "$BUZZ" reactions remove --event "$reply_target" --emoji '⏳' >/dev/null 2>&1 || true
+        rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
+        return 0
+      fi
+    fi
+  fi
   if [ -z "$reply" ] && [ "$watcher_action" = "mute" ]; then
     echo "[$AGENT_NAME worker-$$] silent bow-out on $msg_id - muting thread $root_id"
     (
@@ -1723,6 +1753,14 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
         tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
         tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
         echo "[$AGENT_NAME salon] tap $id: $tv"
+      elif [ "${SALON_LLM_RUNG:-1}" = "1" ]; then
+        # Rung 2 (FR-salon-arbiter-ladder): no Jev verdict -> one-shot harness call.
+        tv="$(salon_llm_verdict "$content")"
+        if [ -n "$tv" ]; then
+          tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
+          tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
+          echo "[$AGENT_NAME salon] llm tap $id: $tv"
+        fi
       fi
     fi
 
@@ -1755,6 +1793,35 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
       ) 200>"$SEEN.lock"
     fi
   done < <(printf '%s' "$msgs" | python3 -c "$SALON_FILTER" "$SEEN" "$BOT_PUB" "${AGENT_ROSTER_FILE:-}")
+}
+
+# LLM rung (FR-salon-arbiter-ladder rung 2): when Jev is unavailable, one cheap
+# harness call decides the same question. Prints a JSON verdict or nothing; the
+# caller applies the same gates (social/low-value -> silence).
+salon_llm_verdict() {  # $1=message content
+  local out prompt result names
+  names="$(awk -F'\t' 'NF>=2{printf "@"$2" "}' "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
+  out="$(mktemp)"
+  prompt="You are the arbiter for a Buzz channel where AI agents and humans converse. Decide whether any agent should reply to the message below, the way a polite human colleague listening in would.
+Reply with ONLY a JSON object, no other text:
+{"who": "<agent-name-from-roster>" or "nobody", "why": "asked|correcting|expertise|social|nothing_to_me", "depth": "message|thread|session"}
+Rules: choose "nobody" for banter, FYIs, status noise, or social chat - agents stay out of human-to-human conversation. Only pick an agent when a human directly asked them, the agent can correct a factual error about to cost someone, or the agent clearly has unique relevant information. When unsure, choose "nobody": wrong silence is cheap, wrong interruption is not.
+
+Roster: ${names:-none}
+Message: $1"
+  invoke_harness "$AGENT_HARNESS" "$out" "$prompt" "$AGENT_MODEL" "" "$AGENT_REPO" "" >/dev/null 2>&1 &
+  wait_with_timeout $!
+  result="$(extract_harness_field "$AGENT_HARNESS" "$out" result)"
+  rm -f "$out"
+  printf '%s' "$result" | python3 -c '
+import sys, json, re
+try:
+    m = re.search(r"\{.*\}", sys.stdin.read(), re.S)
+    v = json.loads(m.group(0))
+    if v.get("who") and v.get("why") and v.get("depth"):
+        print(json.dumps(v))
+except Exception:
+    pass' 2>/dev/null
 }
 
 # Main loop: poll for messages, spawn workers.
