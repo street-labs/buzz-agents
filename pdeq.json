@@ -1,0 +1,7 @@
+{
+  "pdeqVersion": "0.12.0",
+  "specsRoot": ".",
+  "codeRoot": ".",
+  "platforms": ["cli"],
+  "harnesses": ["claude"]
+}

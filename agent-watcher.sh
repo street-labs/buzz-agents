@@ -134,6 +134,24 @@ MODEL_TIMEOUT="${MODEL_TIMEOUT:-600}"
 # before spawning a worker. Off by default; any failure (no key, network error,
 # low confidence) = no verdict = behave exactly as today. See jev-triage.py.
 JEV_TRIAGE_SCRIPT="${JEV_TRIAGE_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/jev-triage.py}"
+
+# --- Salon mode (opt-in multi-agent conversation; see product/salon.md) ---
+# AGENT_SALON_CHANNELS: space-separated salon channel ids (empty = off; every
+# non-salon path is untouched). AGENT_SALON_ARBITER: agent name whose watcher
+# arbitrates the salon channels (one arbiter per channel -> one winner).
+# AGENT_SALON_BLACKBOARD: scratch channel id where tap records and dropped
+# replies are posted (audit trail, invisible to the salon channel).
+AGENT_SALON_CHANNELS="${AGENT_SALON_CHANNELS:-}"
+AGENT_SALON_ARBITER="${AGENT_SALON_ARBITER:-}"
+AGENT_SALON_BLACKBOARD="${AGENT_SALON_BLACKBOARD:-}"
+SALON_SPEAK_MIN="${SALON_SPEAK_MIN:-0.8}"
+SALON_CONF_MIN="${SALON_CONF_MIN:-0.8}"
+SALON_TAP_PREFIX="${SALON_TAP_PREFIX:-[salon tap]}"
+SALON_ARBITER_SCRIPT="${SALON_ARBITER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/salon-arbiter.py}"
+SALON_LLM_RUNG="${SALON_LLM_RUNG:-1}"   # fall back to a one-shot harness call when Jev is unavailable
+is_salon_channel() {  # $1=channel id
+  case " $AGENT_SALON_CHANNELS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
 AMBIENT_COUNT="${AMBIENT_COUNT:-8}"
 MAX_WORKERS="${MAX_WORKERS:-8}"  # max concurrent claude sessions
 BOOT_GRACE="${BOOT_GRACE_SECONDS:-600}"  # on boot, only suppress history OLDER than this; recent unanswered mentions survive a restart
@@ -412,6 +430,11 @@ recent_msgs = json.loads(lines[1]) if len(lines) > 1 and lines[1] else []
 current = json.loads(lines[2]) if len(lines) > 2 and lines[2] else {}
 cid = current.get("id",""); parts = []
 since = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 0
+notes = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
+if notes:
+    # Salon blackboard: shared scratch decisions visible to every participant
+    # (FR-salon-arbiter-reads-blackboard / late-joiner catch-up).
+    parts.append("## Shared scratch notes (salon blackboard, newest last)\n" + notes)
 if thread_msgs:
     if since > 0:
         # Resumed session: only messages that arrived AFTER the last turn we answered.
@@ -1100,6 +1123,7 @@ worker() {
 
   # Mark worker as running
   echo $$ > "$WORKERS/$msg_id.pid"
+  turn_t0="$(date +%s)"
 
   # Eject: owner directly tells us to leave -> drop the thread + session and go silent
   # (just a 👋). Prevents an agent from lingering/meddling in a thread it was told off.
@@ -1121,6 +1145,11 @@ worker() {
   # spend a model turn on the command itself. Agents can also schedule these for the
   # next turn with hidden [[WATCHER: ...]] directives (parsed from their reply below).
   fresh_mode=0
+  # Salon depth=message (FR-salon-depth): the tap grants only the current message -
+  # drop any existing session for this thread so the turn is a cold spawn.
+  if [ "${8:-}" = "message" ]; then
+    reset_thread_session "$root_id"
+  fi
   compact_mode=0
   compact_instructions=""
   if [ "$directly" = "1" ] && printf '%s' "$content" | grep -qiE '^(@[A-Za-z0-9_-]+[[:space:]]+)?/fresh([[:space:]:]|$)'; then
@@ -1464,9 +1493,37 @@ PY
 
   reply_target="$root_id"; [ -z "$reply_target" ] && reply_target="$msg_id"
 
-  # Agent chose to bow out without answering: post nothing, drop the thread from the
-  # watch list, and react 👋. An explicit @tag/p-tag later re-engages (and resumes the
-  # kept session). This is the agent-side counterpart of the owner's eject phrase.
+  # Salon send gate (FR-salon-send-gate): slow turns or turns where new thread
+  # messages arrived while composing get one Jev check. Fail-open: any problem
+  # (no key, error, low confidence) posts unchanged. Direct asks are never
+  # dropped (FR-salon-no-ghosting); drop = quiet, with a blackboard record.
+  if [ -n "$AGENT_SALON_CHANNELS" ] && is_salon_channel "$channel_id" && [ "$directly" != "1" ]; then
+    turn_secs=$(( $(date +%s) - ${turn_t0:-0} ))
+    new_since_start=0
+    if [ -n "$THREAD_JSON" ] && [ "$THREAD_JSON" != "[]" ]; then
+      new_since_start="$(printf '%s' "$THREAD_JSON" | python3 -c '
+import sys, json
+try:
+    t0 = int(sys.argv[1])
+    print(sum(1 for m in json.load(sys.stdin) if m.get("created_at", 0) > t0))
+except Exception:
+    print(0)
+' "${turn_t0:-0}" 2>/dev/null)"
+    fi
+    if [ "$turn_secs" -ge "${SALON_GATE_MIN_SECS:-30}" ] || [ "${new_since_start:-0}" -gt 0 ]; then
+      gv="$(python3 "$SALON_ARBITER_SCRIPT" --gate "$(printf '%s' "$reply" | head -c 2000)" "$(printf '%s' "$THREAD_JSON" | head -c 6000)" 2>/dev/null)"
+      if [ -n "$gv" ]; then
+        echo "[$AGENT_NAME salon] send gate dropped reply for $msg_id: $gv"
+        "$BUZZ" messages send --channel "$AGENT_SALON_BLACKBOARD" \
+          --content "$SALON_TAP_PREFIX dropped-reply salon=$channel_id root=$root_id trigger=$msg_id draft: $(printf '%s' "$reply" | head -c 400)" \
+          >/dev/null 2>&1 || true
+        "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+        "$BUZZ" reactions remove --event "$reply_target" --emoji '⏳' >/dev/null 2>&1 || true
+        rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
+        return 0
+      fi
+    fi
+  fi
   if [ -z "$reply" ] && [ "$watcher_action" = "mute" ]; then
     echo "[$AGENT_NAME worker-$$] silent bow-out on $msg_id - muting thread $root_id"
     (
@@ -1608,6 +1665,170 @@ active_worker_count() {
   echo "$count"
 }
 
+# Salon eligibility pass: for the arbiter's own watcher. Unlike FILTER (which only
+# emits messages addressed to us), this emits every unseen message in the channel
+# with the explicitly-mentioned roster agent (if any), so the arbiter can decide
+# who - if anyone - takes the turn.
+SALON_FILTER='
+import sys, json, base64
+seen = set()
+try:
+    seen = set(open(sys.argv[1]).read().split())
+except Exception:
+    pass
+me_pub = sys.argv[2]
+roster = {}
+try:
+    for line in open(sys.argv[3]):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 2:
+            roster[parts[0]] = parts[1]
+except Exception:
+    pass
+try:
+    msgs = json.load(sys.stdin)
+except Exception:
+    msgs = []
+by_id = {m.get("id", ""): m for m in msgs}
+
+def find_root(m, depth=0):
+    if depth > 5:
+        return (m.get("id", ""), True)
+    root_id = None; reply_to = None
+    for tag in m.get("tags", []):
+        if len(tag) >= 2 and tag[0] == "e":
+            marker = tag[3] if len(tag) > 3 else ""
+            if marker == "root": root_id = tag[1]
+            elif marker == "reply": reply_to = tag[1]
+            elif not marker and reply_to is None: reply_to = tag[1]
+    if root_id: return (root_id, True)
+    if reply_to:
+        parent = by_id.get(reply_to)
+        if parent:
+            pr, _ = find_root(parent, depth + 1); return (pr, True)
+        return (reply_to, True)
+    return (m.get("id", ""), False)
+
+for m in msgs:
+    mid = m.get("id", ""); pub = m.get("pubkey", ""); c = (m.get("content", "") or "")
+    if mid in seen or (me_pub and pub == me_pub):
+        continue
+    ptags = [t[1] for t in m.get("tags", []) if len(t) >= 2 and t[0] == "p"]
+    cl = c.lower()
+    explicit = ""
+    for p in ptags:
+        if p in roster:
+            explicit = roster[p]; break
+    if not explicit:
+        for name in roster.values():
+            if ("@" + name) in cl:
+                explicit = name; break
+    root_id, _ = find_root(m)
+    print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + explicit)
+'
+
+# Salon arbiter pass: process one salon channel's messages. The designated
+# arbiter's watcher runs this INSTEAD of the normal filter/worker path for salon
+# channels; every other salon member's watcher ignores the channel entirely and
+# receives turns via tap records on the blackboard channel (one-winner invariant).
+salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
+  local cid="$1" msgs="$2"
+  local id b64 root_id explicit content tap_name tap_depth tap_pub tv rootpid
+  while IFS=$'\t' read -r id b64 root_id explicit; do
+    [ -z "$id" ] && continue
+    [ -f "$WORKERS/$id.pid" ] && continue
+    (
+      flock 200
+      grep -qxF "$id" "$SEEN" 2>/dev/null && exit 0 || exit 1
+    ) 200>"$SEEN.lock" && continue
+    case "$spawned_roots" in *" $root_id "*) continue ;; esac
+    rootpid="$WORKERS/root-$root_id.pid"
+    if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+    while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do sleep 1; done
+
+    content="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
+
+    # Fast path: an explicit roster mention needs no arbiter call (design edge rule).
+    tap_name=""; tap_depth=""
+    if [ -n "$explicit" ]; then
+      tap_name="$explicit"
+    elif [ -f "$SALON_ARBITER_SCRIPT" ]; then
+      tv="$(python3 "$SALON_ARBITER_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" 2>/dev/null)"
+      if [ -n "$tv" ]; then
+        tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
+        tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
+        echo "[$AGENT_NAME salon] tap $id: $tv"
+      elif [ "${SALON_LLM_RUNG:-1}" = "1" ]; then
+        # Rung 2 (FR-salon-arbiter-ladder): no Jev verdict -> one-shot harness call.
+        tv="$(salon_llm_verdict "$content")"
+        if [ -n "$tv" ]; then
+          tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
+          tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
+          echo "[$AGENT_NAME salon] llm tap $id: $tv"
+        fi
+      fi
+    fi
+
+    if [ -z "$tap_name" ]; then
+      # Silence floor: nobody talks. Mark seen so we do not re-arbitrate every poll.
+      (
+        flock 200
+        echo "$id" >> "$SEEN"
+      ) 200>"$SEEN.lock"
+      continue
+    fi
+
+    if [ "$tap_name" = "$AGENT_NAME" ]; then
+      # The arbiter itself was selected: answer directly.
+      worker "$id" "$cid" "$content" "$root_id" 1 1 "$msgs" "$tap_depth" &
+      echo $! > "$rootpid"
+      spawned_roots="$spawned_roots$root_id "
+    else
+      # Silent tap: machine-readable record on the blackboard channel. The selected
+      # agent's watcher sees the p-tag (its filter passes it) and answers into the
+      # salon thread; every other watcher defers (p-tag names a different agent).
+      tap_pub="$(awk -F'\t' -v n="$tap_name" '$2==n{print $1; exit}' "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
+      "$BUZZ" messages send --channel "$AGENT_SALON_BLACKBOARD" \
+        --content "$SALON_TAP_PREFIX @$tap_name salon=$cid root=$root_id trigger=$id depth=$tap_depth" \
+        ${tap_pub:+--mention "$tap_pub"} >/dev/null 2>&1 || true
+      echo "[$AGENT_NAME salon] tapped $tap_name for $root_id (depth=$tap_depth)"
+      (
+        flock 200
+        echo "$id" >> "$SEEN"
+      ) 200>"$SEEN.lock"
+    fi
+  done < <(printf '%s' "$msgs" | python3 -c "$SALON_FILTER" "$SEEN" "$BOT_PUB" "${AGENT_ROSTER_FILE:-}")
+}
+
+# LLM rung (FR-salon-arbiter-ladder rung 2): when Jev is unavailable, one cheap
+# harness call decides the same question. Prints a JSON verdict or nothing; the
+# caller applies the same gates (social/low-value -> silence).
+salon_llm_verdict() {  # $1=message content
+  local out prompt result names
+  names="$(awk -F'\t' 'NF>=2{printf "@"$2" "}' "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
+  out="$(mktemp)"
+  prompt="You are the arbiter for a Buzz channel where AI agents and humans converse. Decide whether any agent should reply to the message below, the way a polite human colleague listening in would.
+Reply with ONLY a JSON object, no other text:
+{"who": "<agent-name-from-roster>" or "nobody", "why": "asked|correcting|expertise|social|nothing_to_me", "depth": "message|thread|session"}
+Rules: choose "nobody" for banter, FYIs, status noise, or social chat - agents stay out of human-to-human conversation. Only pick an agent when a human directly asked them, the agent can correct a factual error about to cost someone, or the agent clearly has unique relevant information. When unsure, choose "nobody": wrong silence is cheap, wrong interruption is not.
+
+Roster: ${names:-none}
+Message: $1"
+  invoke_harness "$AGENT_HARNESS" "$out" "$prompt" "$AGENT_MODEL" "" "$AGENT_REPO" "" >/dev/null 2>&1 &
+  wait_with_timeout $!
+  result="$(extract_harness_field "$AGENT_HARNESS" "$out" result)"
+  rm -f "$out"
+  printf '%s' "$result" | python3 -c '
+import sys, json, re
+try:
+    m = re.search(r"\{.*\}", sys.stdin.read(), re.S)
+    v = json.loads(m.group(0))
+    if v.get("who") and v.get("why") and v.get("depth"):
+        print(json.dumps(v))
+except Exception:
+    pass' 2>/dev/null
+}
+
 # Main loop: poll for messages, spawn workers.
 # Boot baseline: suppress pre-existing HISTORY older than BOOT_GRACE only, so a mention
 # that arrived just before a restart is NOT swallowed (already-answered recent ones
@@ -1648,6 +1869,14 @@ while true; do
 
     mo=0; is_summon_only "$cid" && mo=1   # summon-only (guest) in this channel?
 
+    # Salon channels bypass the normal path entirely: the designated arbiter's
+    # watcher decides every turn; everyone else waits for a blackboard tap.
+    # Non-salon channels are byte-for-byte the pre-salon path (AC-salon-flagoff).
+    if [ -n "$AGENT_SALON_CHANNELS" ] && is_salon_channel "$cid"; then
+      [ "$AGENT_NAME" = "$AGENT_SALON_ARBITER" ] && salon_arbiter_pass "$cid" "$MSGS"
+      continue
+    fi
+
     while IFS=$'\t' read -r id b64 root_id threaded directly; do
       [ -z "$id" ] && continue
 
@@ -1673,6 +1902,31 @@ while true; do
       done
 
       content="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
+
+      # Salon tap record (posted by the arbiter on the blackboard channel): we were
+      # selected to take a turn in a salon channel. Parse it, fetch the trigger
+      # message, and spawn the worker against the SALON channel/thread.
+      if [ -n "$AGENT_SALON_CHANNELS" ] && printf '%s' "$content" | grep -qF "$SALON_TAP_PREFIX @$AGENT_NAME "; then
+          salon_cid="$(printf '%s' "$content" | sed -n 's/.* salon=\([^ ]*\) .*/\1/p')"
+          salon_root="$(printf '%s' "$content" | sed -n 's/.* root=\([^ ]*\) .*/\1/p')"
+          salon_trigger="$(printf '%s' "$content" | sed -n 's/.* trigger=\([^ ]*\) .*/\1/p')"
+          salon_depth="$(printf '%s' "$content" | sed -n 's/.* depth=\([^ ]*\).*/\1/p')"
+          if [ -n "$salon_cid" ] && [ -n "$salon_trigger" ]; then
+            echo "[$AGENT_NAME salon] taking turn in $salon_cid (root $salon_root, depth ${salon_depth:-thread})"
+            salon_msgs="$("$BUZZ" messages get --channel "$salon_cid" 2>/dev/null)"
+            salon_content="$(get_msg_by_id "$salon_trigger" "$salon_msgs" | python3 -c 'import sys,json;
+try: print(json.load(sys.stdin).get("content",""))
+except Exception: pass' 2>/dev/null)"
+            [ -z "$salon_content" ] && salon_content="$content"
+            ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
+            worker "$salon_trigger" "$salon_cid" "$salon_content" "$salon_root" 1 1 "$salon_msgs" "$salon_depth" &
+            echo $! > "$WORKERS/root-$salon_root.pid"
+            continue
+          else
+            echo "[$AGENT_NAME salon] malformed tap record $id: $(printf '%s' "$content" | tr '\n' ' ' | cut -c1-120)"
+            ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
+          fi
+      fi
 
       # Opt-in Jev triage: a printed verdict = high-confidence "ignore" -> mark
       # seen and skip. Empty output (flag off, no key, error, low confidence)

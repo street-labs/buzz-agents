@@ -1,0 +1,1 @@
+@.pdeq/qa/AGENTS.md
