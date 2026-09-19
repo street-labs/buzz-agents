@@ -1740,7 +1740,7 @@ for m in msgs:
         if p in roster: return "agent @" + roster[p]
         return "human " + p[:8]
     upto = thread[:[x.get("id") for x in thread].index(mid) + 1] if mid in [x.get("id") for x in thread] else thread
-    ctx = "\n".join(f"{label(x)}: {(x.get('content','') or '')[:600]}" for x in upto[-12:])
+    ctx = "\n".join(label(x) + ": " + (x.get("content", "") or "")[:600] for x in upto[-12:])
     # Consecutive agent turns since the last human message (loop cap input).
     agent_turns = 0
     for x in reversed(upto):
