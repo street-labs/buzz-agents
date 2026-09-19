@@ -148,7 +148,9 @@ SALON_SPEAK_MIN="${SALON_SPEAK_MIN:-0.8}"
 SALON_CONF_MIN="${SALON_CONF_MIN:-0.8}"
 # export: salon-arbiter.py reads these from os.environ; unexported they are dead
 # knobs (2026-09-19: arbiter tapped nobody at default 0.8 while env said 0.55).
-export SALON_SPEAK_MIN SALON_CONF_MIN
+SALON_AGENT_CONF_MIN="${SALON_AGENT_CONF_MIN:-0.9}"   # higher bar when the trigger is an agent
+SALON_AGENT_TURN_CAP="${SALON_AGENT_TURN_CAP:-3}"      # consecutive agent turns before a human is required
+export SALON_SPEAK_MIN SALON_CONF_MIN SALON_AGENT_CONF_MIN
 SALON_TAP_PREFIX="${SALON_TAP_PREFIX:-[salon tap]}"
 SALON_ARBITER_SCRIPT="${SALON_ARBITER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/salon-arbiter.py}"
 SALON_LLM_RUNG="${SALON_LLM_RUNG:-1}"   # fall back to a one-shot harness call when Jev is unavailable
@@ -1727,7 +1729,28 @@ for m in msgs:
             if ("@" + name) in cl:
                 explicit = name; break
     root_id, _ = find_root(m)
-    print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + explicit)
+    # Thread context (spec: route the NEXT SPEAKER with conversation context, so a
+    # topic shift mid-thread moves the turn). Labelled by author kind; the arbiter
+    # must reason about agent messages, not treat them as noise.
+    thread = sorted((x for x in msgs if find_root(x)[0] == root_id),
+                    key=lambda x: x.get("created_at", 0))
+    def label(x):
+        p = x.get("pubkey", "")
+        if p == me_pub: return "agent @" + (roster.get(p) or "arbiter")
+        if p in roster: return "agent @" + roster[p]
+        return "human " + p[:8]
+    upto = thread[:[x.get("id") for x in thread].index(mid) + 1] if mid in [x.get("id") for x in thread] else thread
+    ctx = "\n".join(f"{label(x)}: {(x.get('content','') or '')[:600]}" for x in upto[-12:])
+    # Consecutive agent turns since the last human message (loop cap input).
+    agent_turns = 0
+    for x in reversed(upto):
+        if x.get("pubkey", "") in roster or x.get("pubkey", "") == me_pub:
+            agent_turns += 1
+        else:
+            break
+    kind = "agent" if (pub in roster or pub == me_pub) else "human"
+    print("\t".join([mid, base64.b64encode(c.encode()).decode(), root_id, explicit,
+                     base64.b64encode(ctx.encode()).decode(), str(agent_turns), kind]))
 '
 
 # Salon arbiter pass: process one salon channel's messages. The designated
@@ -1736,8 +1759,9 @@ for m in msgs:
 # receives turns via tap records on the blackboard channel (one-winner invariant).
 salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
   local cid="$1" msgs="$2"
-  local id b64 root_id explicit content tap_name tap_depth tap_pub tv rootpid
-  while IFS=$'\t' read -r id b64 root_id explicit; do
+  local id b64 root_id explicit ctx64 agent_turns author_kind ctx
+  local content tap_name tap_depth tap_pub tv rootpid
+  while IFS=$'\t' read -r id b64 root_id explicit ctx64 agent_turns author_kind; do
     [ -z "$id" ] && continue
     [ -f "$WORKERS/$id.pid" ] && continue
     (
@@ -1750,20 +1774,30 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
     while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do sleep 1; done
 
     content="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
+    ctx="$(printf '%s' "$ctx64" | base64 -d 2>/dev/null)"
+
+    # Loop cap (spec): after SALON_AGENT_TURN_CAP consecutive agent turns, only a
+    # human message (or an explicit mention) may continue the chain.
+    if [ "$author_kind" = "agent" ] && [ -z "$explicit" ] \
+       && [ "${agent_turns:-0}" -ge "${SALON_AGENT_TURN_CAP:-3}" ]; then
+      echo "[$AGENT_NAME salon] turn cap ($agent_turns agent turns) - waiting for a human in $root_id"
+      ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
+      continue
+    fi
 
     # Fast path: an explicit roster mention needs no arbiter call (design edge rule).
     tap_name=""; tap_depth=""
     if [ -n "$explicit" ]; then
       tap_name="$explicit"
     elif [ -f "$SALON_ARBITER_SCRIPT" ]; then
-      tv="$(python3 "$SALON_ARBITER_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" 2>/dev/null)"
+      tv="$(python3 "$SALON_ARBITER_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" "$ctx" "$author_kind" 2>/dev/null)"
       if [ -n "$tv" ]; then
         tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
         tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
         echo "[$AGENT_NAME salon] tap $id: $tv"
       elif [ "${SALON_LLM_RUNG:-1}" = "1" ]; then
         # Rung 2 (FR-salon-arbiter-ladder): no Jev verdict -> one-shot harness call.
-        tv="$(salon_llm_verdict "$content")"
+        tv="$(salon_llm_verdict "$content" "$ctx" "$author_kind")"
         if [ -n "$tv" ]; then
           tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
           tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"
@@ -1806,7 +1840,7 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
 # LLM rung (FR-salon-arbiter-ladder rung 2): when Jev is unavailable, one cheap
 # harness call decides the same question. Prints a JSON verdict or nothing; the
 # caller applies the same gates (social/low-value -> silence).
-salon_llm_verdict() {  # $1=message content
+salon_llm_verdict() {  # $1=message content  $2=thread context  $3=author kind
   local out prompt result names
   names="$(awk -F'\t' 'NF>=2{printf "@"$2" "}' "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
   out="$(mktemp)"
@@ -1814,14 +1848,17 @@ salon_llm_verdict() {  # $1=message content
   # double-quoted assignment they terminate the string early (2026-09-19: rung 2
   # crashed on every call with "command not found" instead of producing a verdict).
   prompt="$(cat <<'SALON_LLM_PROMPT'
-You are the arbiter for a Buzz channel where AI agents and humans converse. Decide whether any agent should reply to the message below, the way a polite human colleague listening in would.
+You are the arbiter for a Buzz channel where AI agents and humans converse. Pick the best NEXT SPEAKER after the latest message, whoever sent it (human or agent), or nobody.
 Reply with ONLY a JSON object, no other text:
 {"who": "<agent-name-from-roster>" or "nobody", "why": "asked|correcting|expertise|social|nothing_to_me", "depth": "message|thread|session"}
-Rules: choose "nobody" for banter, FYIs, status noise, or social chat - agents stay out of human-to-human conversation. Only pick an agent when a human directly asked them, the agent can correct a factual error about to cost someone, or the agent clearly has unique relevant information. When unsure, choose "nobody": wrong silence is cheap, wrong interruption is not.
+Rules: route by expertise against the roster, using the thread for topic - a topic shift mid-thread moves the turn to a different agent, and the agent already talking has no claim on the next turn. Choose "nobody" for human-to-human conversation, banter, FYIs, status noise, acknowledgements, restatements, or a completed turn. An agent-authored message needs a higher bar than a human one unless it tags an agent or asks a direct question. When unsure, choose "nobody": wrong silence is cheap, wrong interruption is not.
 
 SALON_LLM_PROMPT
 ) roster: ${names:-none}
-message: $1"
+latest message author: ${3:-human}
+thread so far:
+${2:-(none)}
+latest message: $1"
   invoke_harness "$AGENT_HARNESS" "$out" "$prompt" "$AGENT_MODEL" "" "$AGENT_REPO" "" >/dev/null 2>&1 &
   wait_with_timeout $!
   result="$(extract_harness_field "$AGENT_HARNESS" "$out" result)"

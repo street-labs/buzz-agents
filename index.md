@@ -22,6 +22,9 @@ This file maps every requirement slug to all files that define or reference it. 
 | FR-salon-silence-floor | FR | product/salon.md | engineering/salon.md |  |
 | FR-salon-silent-tap | FR | product/salon.md | engineering/salon.md |  |
 | FR-salon-arbiter-inputs | FR | product/salon.md | engineering/salon.md |  |
+| FR-salon-next-speaker | FR | product/salon.md | engineering/salon.md |  |
+| FR-salon-human-to-human | FR | product/salon.md | engineering/salon.md |  |
+| FR-salon-agent-turn-cap | FR | product/salon.md | engineering/salon.md |  |
 | FR-salon-depth | FR | product/salon.md | engineering/salon.md |  |
 | FR-salon-slots | FR | product/salon.md | engineering/salon.md |  |
 | FR-salon-late-join | FR | product/salon.md | engineering/salon.md |  |

@@ -8,7 +8,7 @@ off, no key, API error, low confidence, social/no-op verdict). The watcher
 treats empty output as "nobody talks" -> silence floor.
 
 Usage:
-    salon-arbiter.py <message-content> <my-name> <roster-file> [thread-context]
+    salon-arbiter.py <message-content> <my-name> <roster-file> [thread-context] [author-kind]
     salon-arbiter.py --gate <draft-reply> [recent-thread]   (send gate)
 Config via env:
     TYPESAFE_API_KEY          or ~/.typesafe/key
@@ -28,6 +28,8 @@ import urllib.request
 ENDPOINT = os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone")
 CONF_MIN = float(os.environ.get("SALON_CONF_MIN", "0.8"))
 SPEAK_MIN = float(os.environ.get("SALON_SPEAK_MIN", "0.8"))
+# Agent-authored messages need a higher bar than human ones (loop pressure).
+AGENT_CONF_MIN = float(os.environ.get("SALON_AGENT_CONF_MIN", "0.9"))
 # why values that may earn a tap; social/nothing_to_me never tap (silence floor).
 TAPPABLE_WHY = {"asked", "correcting", "expertise"}
 
@@ -43,7 +45,7 @@ def _key():
     return key
 
 
-def ask(content, my_name, roster_names, thread_context, descriptions=None):
+def ask(content, my_name, roster_names, thread_context, descriptions=None, author_kind="human"):
     key = _key()
     if not content:
         raise RuntimeError("empty message")
@@ -52,21 +54,30 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
     criteria = {n: descriptions.get(n, f"agent @{n}") for n in roster_names if n != my_name}
     if my_name:
         criteria[my_name] = f"me, the watcher agent @{my_name}"
-    criteria["nobody"] = "no agent should reply; leave the room to the humans"
+    criteria["nobody"] = (
+        "no agent should take the next turn: the humans are talking to each other, "
+        "the turn is complete, or the message does not invite a useful response"
+    )
     questions = {
         "who_next": {
             "type": "choice",
-            "instructions": "Which agent should take the next turn, or nobody",
+            "instructions": (
+                "Who is the best NEXT participant to speak after this message in this "
+                "conversation, judged by whose described expertise the latest message "
+                "now needs - not by who was asked and not by who spoke last. A topic "
+                "shift mid-thread moves the turn to a different agent; the agent already "
+                "engaged is only a tie-breaker between otherwise equal candidates."
+            ),
             "criteria": criteria,
         },
         "why": {
             "type": "choice",
-            "instructions": "Why would that agent speak",
+            "instructions": "Why would that participant take the next turn",
             "criteria": {
-                "asked": "a human directly asked or addressed that agent",
+                "asked": "someone directly asked or addressed that agent, or handed off to it",
                 "correcting": "the agent has a factual correction that prevents an error",
                 "expertise": "the agent clearly has unique relevant information",
-                "social": "social banter or chat among humans",
+                "social": "banter, acknowledgement, restatement, or humans talking to each other",
                 "nothing_to_me": "nothing for any agent here",
             },
         },
@@ -81,7 +92,11 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
         },
         "speak_now": {
             "type": "noul",
-            "instructions": "Would it be natural (not interruptive) for the chosen agent to reply to this message right now, the way a knowledgeable colleague listening in would",
+            "instructions": (
+                "Would it be natural (not interruptive) for the chosen agent to take the "
+                "next turn right now, the way a knowledgeable colleague listening in "
+                "would. Interjecting in a human-to-human exchange is never natural."
+            ),
         },
     }
     state = content
@@ -91,8 +106,14 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
             for n in roster_names if n != my_name
         )
         state = f"watcher agent: @{my_name}; roster: {roster_lines}\n\nmessage:\n{content}"
+    state = f"latest message author: {author_kind}\n" + state
     if thread_context:
-        state += f"\n\nrecent thread:\n{thread_context[-4000:]}"
+        state += f"\n\nconversation so far (oldest first, latest message last):\n{thread_context[-4000:]}"
+    if author_kind == "agent":
+        state += ("\n\nNote: the latest message is from an agent, not a human. An "
+                  "agent-to-agent turn needs a higher bar than answering a human: only "
+                  "continue when the message asks something specific or clearly needs "
+                  "another agent's expertise.")
     body = json.dumps({"state": state, "model": "jev-latest", "questions": questions}).encode()
     req = urllib.request.Request(ENDPOINT, data=body, method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -104,7 +125,7 @@ def depth_from_score(score):
     return "message" if score < 0.5 else ("thread" if score < 1.5 else "session")
 
 
-def verdict(data, roster_names):
+def verdict(data, roster_names, author_kind="human"):
     a = data["answers"]
     who = a["who_next"]["choice"]
     why = a["why"]["choice"]
@@ -112,7 +133,8 @@ def verdict(data, roster_names):
     conf = float(a["who_next"]["confidence"])
     depth = depth_from_score(float(a["depth"]["score"]))
     # Silence floor: social/no-op or low confidence -> nobody talks.
-    if who == "nobody" or why not in TAPPABLE_WHY or speak < SPEAK_MIN or conf < CONF_MIN:
+    floor = AGENT_CONF_MIN if author_kind == "agent" else CONF_MIN
+    if who == "nobody" or why not in TAPPABLE_WHY or speak < SPEAK_MIN or conf < floor:
         return None
     return {"who": who, "why": why, "depth": depth, "confidence": round(conf, 3)}
 
@@ -172,6 +194,7 @@ def main():
     my_name = sys.argv[2] if len(sys.argv) > 2 else ""
     roster_file = sys.argv[3] if len(sys.argv) > 3 else ""
     thread_context = sys.argv[4] if len(sys.argv) > 4 else ""
+    author_kind = sys.argv[5] if len(sys.argv) > 5 else "human"
     names = []
     descriptions = {}
     if roster_file and os.path.exists(roster_file):
@@ -189,7 +212,7 @@ def main():
     if my_name and my_name not in names:
         names.append(my_name)
     try:
-        v = verdict(ask(content, my_name, names, thread_context, descriptions), names)
+        v = verdict(ask(content, my_name, names, thread_context, descriptions, author_kind), names, author_kind)
     except Exception as e:
         print(f"salon-arbiter: {e}", file=sys.stderr)
         sys.exit(1)
