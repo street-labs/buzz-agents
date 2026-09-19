@@ -146,6 +146,9 @@ AGENT_SALON_ARBITER="${AGENT_SALON_ARBITER:-}"
 AGENT_SALON_BLACKBOARD="${AGENT_SALON_BLACKBOARD:-}"
 SALON_SPEAK_MIN="${SALON_SPEAK_MIN:-0.8}"
 SALON_CONF_MIN="${SALON_CONF_MIN:-0.8}"
+# export: salon-arbiter.py reads these from os.environ; unexported they are dead
+# knobs (2026-09-19: arbiter tapped nobody at default 0.8 while env said 0.55).
+export SALON_SPEAK_MIN SALON_CONF_MIN
 SALON_TAP_PREFIX="${SALON_TAP_PREFIX:-[salon tap]}"
 SALON_ARBITER_SCRIPT="${SALON_ARBITER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/salon-arbiter.py}"
 SALON_LLM_RUNG="${SALON_LLM_RUNG:-1}"   # fall back to a one-shot harness call when Jev is unavailable
@@ -1807,13 +1810,18 @@ salon_llm_verdict() {  # $1=message content
   local out prompt result names
   names="$(awk -F'\t' 'NF>=2{printf "@"$2" "}' "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
   out="$(mktemp)"
-  prompt="You are the arbiter for a Buzz channel where AI agents and humans converse. Decide whether any agent should reply to the message below, the way a polite human colleague listening in would.
+  # Single-quoted heredoc: the JSON template contains double quotes, and inside a
+  # double-quoted assignment they terminate the string early (2026-09-19: rung 2
+  # crashed on every call with "command not found" instead of producing a verdict).
+  prompt="$(cat <<'SALON_LLM_PROMPT'
+You are the arbiter for a Buzz channel where AI agents and humans converse. Decide whether any agent should reply to the message below, the way a polite human colleague listening in would.
 Reply with ONLY a JSON object, no other text:
 {"who": "<agent-name-from-roster>" or "nobody", "why": "asked|correcting|expertise|social|nothing_to_me", "depth": "message|thread|session"}
 Rules: choose "nobody" for banter, FYIs, status noise, or social chat - agents stay out of human-to-human conversation. Only pick an agent when a human directly asked them, the agent can correct a factual error about to cost someone, or the agent clearly has unique relevant information. When unsure, choose "nobody": wrong silence is cheap, wrong interruption is not.
 
-Roster: ${names:-none}
-Message: $1"
+SALON_LLM_PROMPT
+) roster: ${names:-none}
+message: $1"
   invoke_harness "$AGENT_HARNESS" "$out" "$prompt" "$AGENT_MODEL" "" "$AGENT_REPO" "" >/dev/null 2>&1 &
   wait_with_timeout $!
   result="$(extract_harness_field "$AGENT_HARNESS" "$out" result)"
