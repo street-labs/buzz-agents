@@ -66,6 +66,20 @@ instead of a summon-only helpdesk - and so every buzz-agents setup without it
   thread context, agent roster with specialties, and recent blackboard notes as
   reference state. Decisions return who_next, why, depth, and speak_now.
 
+### Turn routing
+
+- **Next speaker, not answerer** `FR-salon-next-speaker`: The arbiter evaluates
+  every message (human or agent) and picks the best NEXT speaker, routing by
+  described expertise with thread context, so a topic shift mid-thread moves the
+  turn to a different agent. Conversational affinity is a tie-breaker only.
+- **Human-to-human is nobody** `FR-salon-human-to-human`: Two humans talking to
+  each other resolves to nobody, even when the topic matches an agent's lane.
+  Replies address the author of the triggering message; a thread has no owner.
+- **Agent-turn cap** `FR-salon-agent-turn-cap`: Agent-to-agent turns are allowed
+  at a higher confidence bar, capped at `SALON_AGENT_TURN_CAP` (default 3)
+  consecutive agent turns. Any human message resets the counter; an explicit
+  mention always routes.
+
 ### Context depth
 
 - **Depth levels** `FR-salon-depth`: The arbiter grants context depth:

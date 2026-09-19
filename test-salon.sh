@@ -32,6 +32,8 @@ assert m.verdict(ans(who="borg", why="social", conf=0.99, speak=0.99), []) is No
 assert m.verdict(ans(who="borg", why="asked", conf=0.99, speak=0.99), []) is not None, "clear ask must tap"
 assert m.verdict(ans(who="borg", why="asked", conf=0.5, speak=0.99), []) is None, "low conf must not tap"
 assert m.verdict(ans(who="borg", why="asked", conf=0.99, speak=0.5), []) is None, "low speak_now must not tap"
+assert m.verdict(ans(who="borg", why="expertise", conf=0.85, speak=0.99), [], "agent") is None, "agent msg needs higher conf"
+assert m.verdict(ans(who="borg", why="expertise", conf=0.95, speak=0.99), [], "agent") is not None, "confident agent handoff taps"
 assert m.depth_from_score(0.2) == "message" and m.depth_from_score(1.0) == "thread" and m.depth_from_score(1.8) == "session"
 print("arbiter unit ok")
 PY
@@ -68,5 +70,39 @@ GATE_BLOCK="$(sed -n '/Salon send gate (FR-salon-send-gate)/,/^  fi$/p' agent-wa
 [ -n "$GATE_BLOCK" ] || fail "send gate block not found"
 [[ "$GATE_BLOCK" == *'"$directly" != "1"'* ]] || fail "direct asks must bypass the gate"
 [[ "$GATE_BLOCK" == *'if [ -n "$gv" ]'* ]] || fail "empty gate verdict must fail open (only drop when gv non-empty)"
+
+# 6. Thread routing wiring (PR #17): the filter emits thread context, the agent-turn
+# count and author kind; the arbiter pass enforces the consecutive-agent-turn cap.
+SALON_FILTER="$(sed -n "/^SALON_FILTER='/,/^'$/p" agent-watcher.sh | sed "1s/^SALON_FILTER='//; \$s/^'$//")"
+python3 - "$SALON_FILTER" <<'PY' || fail "salon filter thread context"
+import base64, json, subprocess, sys, tempfile, os
+src = sys.argv[1]
+roster = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False)
+roster.write("pubborg\tborg\tpricing and marketing\npubcs\tcoffee-shop\tthe cafe app\n"); roster.close()
+seen = tempfile.NamedTemporaryFile("w", delete=False); seen.close()
+msgs = [
+  {"id": "m1", "pubkey": "human1", "content": "hey coffee-shop, question", "created_at": 1, "tags": []},
+  {"id": "m2", "pubkey": "pubcs", "content": "which part?", "created_at": 2, "tags": [["e", "m1", "", "root"]]},
+  {"id": "m3", "pubkey": "human1", "content": "actually marketing and pricing", "created_at": 3, "tags": [["e", "m1", "", "root"]]},
+]
+out = subprocess.run([sys.executable, "-c", src, seen.name, "mepub", roster.name],
+                     input=json.dumps(msgs), capture_output=True, text=True)
+assert out.returncode == 0, out.stderr
+rows = [l.split("\t") for l in out.stdout.strip().split("\n")]
+assert all(len(r) == 7 for r in rows), rows
+last = rows[-1]
+assert last[0] == "m3" and last[2] == "m1" and last[6] == "human", last
+ctx = base64.b64decode(last[4]).decode()
+assert "agent @coffee-shop: which part?" in ctx and "actually marketing" in ctx, ctx
+assert last[5] == "0", "human message resets the agent-turn counter"
+m2 = [r for r in rows if r[0] == "m2"][0]
+assert m2[6] == "agent" and m2[5] == "1", m2
+os.unlink(roster.name); os.unlink(seen.name)
+print("salon filter ok")
+PY
+
+PASS_BLOCK="$(sed -n '/^salon_arbiter_pass()/,/^}/p' agent-watcher.sh)"
+[[ "$PASS_BLOCK" == *'SALON_AGENT_TURN_CAP:-3'* ]] || fail "agent turn cap missing"
+[[ "$PASS_BLOCK" == *'"$ctx" "$author_kind"'* ]] || fail "thread context not passed to the arbiter"
 
 echo "salon: all tests passed"
