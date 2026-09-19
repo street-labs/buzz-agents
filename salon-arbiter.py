@@ -52,7 +52,12 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None, autho
 
     descriptions = descriptions or {}
     criteria = {n: descriptions.get(n, f"agent @{n}") for n in roster_names if n != my_name}
-    if my_name:
+    # A dedicated arbiter routes turns and never takes one, so offering itself as a
+    # candidate can only misroute. Measured under the current prompt it never wins
+    # (P(arbiter) 0.02-0.12), but it is a standing trap: set SALON_ARBITER_SPEAKS=0
+    # for a non-participant arbiter to drop it from the ballot entirely. Default
+    # keeps the old behavior for setups where the arbiter is also a participant.
+    if my_name and os.environ.get("SALON_ARBITER_SPEAKS", "1") != "0":
         criteria[my_name] = f"me, the watcher agent @{my_name}"
     criteria["nobody"] = (
         "no agent should take the next turn: the humans are talking to each other, "
