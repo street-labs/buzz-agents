@@ -1756,7 +1756,41 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
     if [ -n "$explicit" ]; then
       tap_name="$explicit"
     elif [ -f "$SALON_ARBITER_SCRIPT" ]; then
-      tv="$(python3 "$SALON_ARBITER_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" 2>/dev/null)"
+      salon_ctx="$(printf '%s' "$msgs" | python3 -c '
+import sys, json
+try:
+    msgs = json.load(sys.stdin)
+except Exception:
+    msgs = []
+trigger = sys.argv[1]
+me_pub = sys.argv[2]
+roster = {}
+try:
+    for line in open(sys.argv[3]):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 2:
+            roster[parts[0]] = parts[1]
+except Exception:
+    pass
+out = []
+for m in msgs:
+    c = (m.get("content", "") or "")
+    if not c.strip() or m.get("id") == trigger:
+        continue
+    # Label each speaker distinctly so the arbiter can tell a human-to-human
+    # exchange (stay out) from a human asking the room (route a turn). Several
+    # humans may share a channel: never collapse them into one "human".
+    pub = m.get("pubkey", "")
+    if pub == me_pub:
+        who = "me"
+    elif pub in roster:
+        who = "agent " + roster[pub]
+    else:
+        who = "human-" + (pub[:6] if pub else "unknown")
+    out.append(f"{who}: {c[:300]}")
+print("\n".join(out[-12:]))
+' "$id" "$BOT_PUB" "${AGENT_ROSTER_FILE:-/dev/null}" 2>/dev/null)"
+    tv="$(python3 "$SALON_ARBITER_SCRIPT" "$content" "$AGENT_NAME" "${AGENT_ROSTER_FILE:-}" "$salon_ctx" 2>/dev/null)"
       if [ -n "$tv" ]; then
         tap_name="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin)["who"])' 2>/dev/null)"
         tap_depth="$(printf '%s' "$tv" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("depth","thread"))' 2>/dev/null)"

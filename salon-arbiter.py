@@ -50,24 +50,37 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
 
     descriptions = descriptions or {}
     criteria = {n: descriptions.get(n, f"agent @{n}") for n in roster_names if n != my_name}
-    if my_name:
+    # A dedicated arbiter routes turns and never takes one itself; it must not be a
+    # candidate or it will route conversations to itself (2026-09-19: a topic shift
+    # that belonged to @borg was routed to @arbiter). SALON_ARBITER_SPEAKS=1 restores
+    # the old behavior for setups where the arbiter is also a participant.
+    if my_name and os.environ.get("SALON_ARBITER_SPEAKS", "1") == "1":
         criteria[my_name] = f"me, the watcher agent @{my_name}"
-    criteria["nobody"] = "no agent should reply; leave the room to the humans"
+    criteria["nobody"] = (
+        "no agent should take the next turn: the humans are talking to each other, "
+        "the turn is complete, or nothing here needs an agent"
+    )
     questions = {
         "who_next": {
             "type": "choice",
-            "instructions": "Which agent should take the next turn, or nobody",
+            "instructions": (
+                "Who should take the NEXT turn in this conversation after the latest "
+                "message, or nobody. The latest message may come from a human or from "
+                "another agent; route on what the conversation now needs, not on who "
+                "was addressed last. If the topic has shifted into a different agent's "
+                "area, choose that agent even if a different agent spoke previously."
+            ),
             "criteria": criteria,
         },
         "why": {
             "type": "choice",
-            "instructions": "Why would that agent speak",
+            "instructions": "Why would that agent take the next turn",
             "criteria": {
-                "asked": "a human directly asked or addressed that agent",
+                "asked": "someone directly asked or addressed that agent, or another agent handed off to them",
                 "correcting": "the agent has a factual correction that prevents an error",
-                "expertise": "the agent clearly has unique relevant information",
-                "social": "social banter or chat among humans",
-                "nothing_to_me": "nothing for any agent here",
+                "expertise": "the topic is in that agent's area and it has relevant information to add",
+                "social": "banter, acknowledgement, or conversation between humans",
+                "nothing_to_me": "the turn is complete or nothing here needs an agent",
             },
         },
         "depth": {
@@ -81,7 +94,13 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
         },
         "speak_now": {
             "type": "noul",
-            "instructions": "Would it be natural (not interruptive) for the chosen agent to reply to this message right now, the way a knowledgeable colleague listening in would",
+            "instructions": (
+                "Would it be natural (not interruptive) for the chosen agent to take the "
+                "next turn right now, the way a knowledgeable colleague in the room would. "
+                "Humans talking to each other is the clearest case for staying quiet. An "
+                "acknowledgement, a restatement, or a message that completes its own point "
+                "invites no further turn."
+            ),
         },
     }
     state = content
@@ -92,7 +111,10 @@ def ask(content, my_name, roster_names, thread_context, descriptions=None):
         )
         state = f"watcher agent: @{my_name}; roster: {roster_lines}\n\nmessage:\n{content}"
     if thread_context:
-        state += f"\n\nrecent thread:\n{thread_context[-4000:]}"
+        state += (
+            f"\n\nrecent conversation (oldest first, latest message excluded, "
+            f"speakers marked human or agent):\n{thread_context[-4000:]}"
+        )
     body = json.dumps({"state": state, "model": "jev-latest", "questions": questions}).encode()
     req = urllib.request.Request(ENDPOINT, data=body, method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -112,6 +134,11 @@ def verdict(data, roster_names):
     conf = float(a["who_next"]["confidence"])
     depth = depth_from_score(float(a["depth"]["score"]))
     # Silence floor: social/no-op or low confidence -> nobody talks.
+    #
+    # who_next + why carry the routing signal; speak_now is a weak discriminator
+    # (measured 0.35-0.68 across both correct taps and correct silences, scoring
+    # LOWER on real questions than on banter), so it is a low floor rather than a
+    # primary gate. Gating on it at 0.8 muted the salon entirely.
     if who == "nobody" or why not in TAPPABLE_WHY or speak < SPEAK_MIN or conf < CONF_MIN:
         return None
     return {"who": who, "why": why, "depth": depth, "confidence": round(conf, 3)}
