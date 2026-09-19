@@ -1749,7 +1749,12 @@ for m in msgs:
         else:
             break
     kind = "agent" if (pub in roster or pub == me_pub) else "human"
-    print("\t".join([mid, base64.b64encode(c.encode()).decode(), root_id, explicit,
+    # "-" not "" for no explicit mention: bash `read` with IFS=$'\t' collapses an
+    # empty field, so an empty `explicit` shifts ctx64 into it and every later
+    # field left by one. The arbiter then taps a base64 context blob as an agent
+    # name. explicit is empty on the large majority of messages, so this misfires
+    # constantly. The caller maps "-" back to empty.
+    print("\t".join([mid, base64.b64encode(c.encode()).decode(), root_id, explicit or "-",
                      base64.b64encode(ctx.encode()).decode(), str(agent_turns), kind]))
 '
 
@@ -1763,6 +1768,7 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
   local content tap_name tap_depth tap_pub tv rootpid
   while IFS=$'\t' read -r id b64 root_id explicit ctx64 agent_turns author_kind; do
     [ -z "$id" ] && continue
+    [ "$explicit" = "-" ] && explicit=""
     [ -f "$WORKERS/$id.pid" ] && continue
     (
       flock 200
