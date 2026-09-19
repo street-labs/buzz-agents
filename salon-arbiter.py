@@ -43,12 +43,13 @@ def _key():
     return key
 
 
-def ask(content, my_name, roster_names, thread_context):
+def ask(content, my_name, roster_names, thread_context, descriptions=None):
     key = _key()
     if not content:
         raise RuntimeError("empty message")
 
-    criteria = {n: f"agent @{n}" for n in roster_names if n != my_name}
+    descriptions = descriptions or {}
+    criteria = {n: descriptions.get(n, f"agent @{n}") for n in roster_names if n != my_name}
     if my_name:
         criteria[my_name] = f"me, the watcher agent @{my_name}"
     criteria["nobody"] = "no agent should reply; leave the room to the humans"
@@ -85,7 +86,11 @@ def ask(content, my_name, roster_names, thread_context):
     }
     state = content
     if my_name:
-        state = f"watcher agent: @{my_name}; roster: {', '.join('@' + n for n in roster_names)}\n\nmessage:\n{content}"
+        roster_lines = ", ".join(
+            f"@{n}" + (f" ({descriptions[n]})" if n in descriptions else "")
+            for n in roster_names if n != my_name
+        )
+        state = f"watcher agent: @{my_name}; roster: {roster_lines}\n\nmessage:\n{content}"
     if thread_context:
         state += f"\n\nrecent thread:\n{thread_context[-4000:]}"
     body = json.dumps({"state": state, "model": "jev-latest", "questions": questions}).encode()
@@ -168,16 +173,23 @@ def main():
     roster_file = sys.argv[3] if len(sys.argv) > 3 else ""
     thread_context = sys.argv[4] if len(sys.argv) > 4 else ""
     names = []
+    descriptions = {}
     if roster_file and os.path.exists(roster_file):
         try:
             with open(roster_file) as f:
-                names = [l.split("\t")[1].strip() for l in f if "\t" in l]
+                for l in f:
+                    if "\t" not in l:
+                        continue
+                    cols = l.rstrip("\n").split("\t")
+                    names.append(cols[1].strip())
+                    if len(cols) > 2 and cols[2].strip():
+                        descriptions[cols[1].strip()] = cols[2].strip()
         except Exception:
             names = []
     if my_name and my_name not in names:
         names.append(my_name)
     try:
-        v = verdict(ask(content, my_name, names, thread_context), names)
+        v = verdict(ask(content, my_name, names, thread_context, descriptions), names)
     except Exception as e:
         print(f"salon-arbiter: {e}", file=sys.stderr)
         sys.exit(1)
