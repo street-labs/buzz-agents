@@ -5,6 +5,12 @@ cd "$(dirname "$0")"
 
 fail() { echo "FAIL: $1"; exit 1; }
 
+# 0. Embedded python payloads must compile as bash delivers them. Python inside a
+# single-quoted bash string breaks silently when the python contains a single
+# quote; bash -n cannot see it. Shipped three times (#16 rung-2 prompt, #17/#20
+# SALON_FILTER), each time taking the salon fully silent.
+./check-embedded-python.sh >/dev/null || fail "embedded python payload does not compile (run ./check-embedded-python.sh)"
+
 # 1. Salon helpers parse + flag-off behavior (extracted from the watcher).
 SALON_BLOCK="$(sed -n '/^AGENT_SALON_CHANNELS=/,/^}/p' agent-watcher.sh)"
 [ -n "$SALON_BLOCK" ] || fail "salon config block not found"
