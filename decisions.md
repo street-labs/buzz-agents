@@ -202,4 +202,28 @@ consolidates project-specific clutter out of the framework agent file.
   prose is maintained by the agent as facts change; only the manifest is
   structured/cross-checkable.
 
+## 2026-09-20 — Jev as the stall decider, regex demoted to fallback
+**Decision:** The stall watch's done-vs-still-working judgment is made by an
+opt-in Jev call (`jev-stall.py`, `AGENT_JEV_STALL=1`): each reply is classified
+done / wip / blocked and only wip or blocked keeps the watch armed. The regex
+heuristics (`is_thread_resolved`, `stall_is_open_ended`) are demoted to the
+fallback when Jev is off, errors, or returns low confidence. Declared waits
+(`[[WATCHER: wait ...]]`) always arm regardless of the verdict — the agent
+promised to report back. Fail-open contract identical to jev-triage (#14):
+no verdict = behave exactly as today. Also adds the resume protocol to the
+base prompt: on any summon, check thread tail + git state for unfinished work
+before taking new work.
+**Rationale:** The regex only sees the last line's wording, so a closing
+summary that mentions "next" or a genuinely finished turn phrased loosely
+mis-arms (or silently drops) the watch. Jev reads the whole reply. Watchdog
+auto-resume then targets only real stalls, and every accidental restart
+recovers via the resume protocol.
+**Alternatives considered:**
+- Jev-gating the resume too (decide whether to re-summon). Rejected for v1 —
+  the resume is cheap and self-guarded (max attempts, escalates to owner);
+  a wrong "done" verdict on the watch decision is the costly error.
+- Extending jev-triage.py with a mode flag. Rejected — separate opt-in gate
+  lets the two features be enabled independently; plumbing duplication is ~25
+  lines.
+
 <!-- Decision entries appear below, oldest first. -->

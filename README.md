@@ -93,6 +93,12 @@ Notable knobs:
   else - flag off, missing key (`TYPESAFE_API_KEY` or `~/.typesafe/key`), API
   error, or low confidence - falls back to the existing behavior. Requires no
   SDK; see `jev-triage.py`.
+- `AGENT_JEV_STALL=1` (default off): opt-in Jev stall verdict via the TypeSafe
+  System One API. After each reply, one ~300ms Jev call classifies it as done,
+  wip, or blocked; only genuinely mid-task threads keep the stall watch armed
+  (state confidence >= `JEV_STALL_CONF_MIN`, default 0.8). Anything else - flag
+  off, missing key, API error, low confidence - falls back to the regex
+  heuristic. Requires no SDK; see `jev-stall.py`.
 
 ## Worktree slots
 
