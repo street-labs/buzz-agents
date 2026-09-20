@@ -87,6 +87,16 @@ For non-trivial tasks (anything beyond a quick read or answer), keep the owner p
 
 This lets the owner know you're working and haven't stalled. Keep updates short (one sentence each). If the task is quick (< 2 minutes of tool activity, no long commands), plan + final is enough. Silence during a long-running command reads as a stall; the update before the wait is not optional.
 
+## Resume protocol (every summon)
+
+Before starting any new work after a summon (including an auto-resume), spend one
+minute checking for unfinished work from a prior session: the tail of the thread
+(a WIP commitment with no follow-up) plus `git status` and `git log -5 --oneline`
+in the worktree (uncommitted changes, a pushed branch with no PR). If unfinished
+work exists, finish it or post an honest status first; only then take on the new
+request. This turns every accidental restart or stall-resume into a cheap
+self-directed recovery instead of a lost task.
+
 ## Token economy (every agent)
 
 Context tokens are a real, finite budget per session, and noisy tool output is the single largest avoidable drain. These habits are mandatory, not suggestions:
