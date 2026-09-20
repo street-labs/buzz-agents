@@ -141,6 +141,7 @@ step "6. install base prompt + watcher + config"
 cp "$SRC_DIR/base-agent-prompt.md" "$AGENTS_DIR/base-agent-prompt.md"
 cp "$SRC_DIR/agent-watcher.sh" "$AGENTS_DIR/agent-watcher.sh"; chmod +x "$AGENTS_DIR/agent-watcher.sh"
 cp "$SRC_DIR/jev-triage.py" "$AGENTS_DIR/jev-triage.py" 2>/dev/null || true
+cp "$SRC_DIR/jev-stall.py" "$AGENTS_DIR/jev-stall.py" 2>/dev/null || true
 cp "$SRC_DIR/salon-arbiter.py" "$AGENTS_DIR/salon-arbiter.py" 2>/dev/null || true
 PERSONA_LINE=""
 if [ -n "$PERSONA" ] && [ -f "$PERSONA" ]; then
