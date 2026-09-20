@@ -134,6 +134,10 @@ MODEL_TIMEOUT="${MODEL_TIMEOUT:-600}"
 # before spawning a worker. Off by default; any failure (no key, network error,
 # low confidence) = no verdict = behave exactly as today. See jev-triage.py.
 JEV_TRIAGE_SCRIPT="${JEV_TRIAGE_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/jev-triage.py}"
+# Opt-in Jev stall verdict: classifies a reply as done/wip/blocked so the stall
+# watch keeps only genuinely mid-task threads. Regex heuristics (stall_is_open_ended,
+# is_thread_resolved) are the fallback when Jev is off or returns no verdict.
+JEV_STALL_SCRIPT="${JEV_STALL_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/jev-stall.py}"
 
 # --- Salon mode (opt-in multi-agent conversation; see product/salon.md) ---
 # AGENT_SALON_CHANNELS: space-separated salon channel ids (empty = off; every
@@ -1046,9 +1050,25 @@ stall_delete() {  # $1 = root_id
 # if the reply is open-ended (declared wait or heuristic), records the deadline, and
 # drops the watch for resolved or normally finished threads.
 stall_watch_record() {  # $1=root $2=channel $3=reply $4=declared_wait_secs
-  local root="$1" cid="$2" reply="$3" wsecs="${4:-0}" now deadline attempts b64
+  local root="$1" cid="$2" reply="$3" wsecs="${4:-0}" now deadline attempts b64 keep=0 v=""
   now="$(date +%s)"
-  if is_thread_resolved "$reply" || { ! stall_is_open_ended "$reply" && [ "$wsecs" -eq 0 ]; }; then
+  if [ "$wsecs" -gt 0 ]; then
+    keep=1  # declared wait: the agent promised to report back, always watch
+  else
+    # Jev is the decider (done -> drop, wip/blocked -> watch). Empty output
+    # (flag off, no key, API error, low confidence) -> regex fallback.
+    if [ "${AGENT_JEV_STALL:-0}" = "1" ] && [ -f "$JEV_STALL_SCRIPT" ]; then
+      v="$(python3 "$JEV_STALL_SCRIPT" "$reply" 2>/dev/null)"
+    fi
+    if [ -n "$v" ]; then
+      case "$(printf '%s' "$v" | sed -n 's/.*"state":[[:space:]]*"\([a-z]*\)".*/\1/p')" in
+        wip|blocked) keep=1 ;;
+      esac
+    elif ! is_thread_resolved "$reply" && stall_is_open_ended "$reply"; then
+      keep=1
+    fi
+  fi
+  if [ "$keep" = 0 ]; then
     stall_delete "$root"
     return
   fi
