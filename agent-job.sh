@@ -25,7 +25,21 @@ set -uo pipefail
 AGENT_NAME="${AGENT_NAME:?set AGENT_NAME}"
 JOBS="$HOME/.buzz/agents/$AGENT_NAME/jobs"
 BUZZ="${BUZZ:-$(command -v buzz || echo "$HOME/.buzz/bin/buzz")}"
+MAX_SEND_ATTEMPTS="${MAX_JOB_SEND_ATTEMPTS:-10}"
+BACKOFF_BASE="${JOB_BACKOFF_BASE:-60}"
 mkdir -p "$JOBS"
+
+# Our pubkey. Passed as an explicit --mention below, it makes the literal
+# "@$AGENT_NAME" in the outcome text presentation-only - the relay rejects any
+# @token that does not match a channel member, and AGENT_NAME can drift from the
+# profile name (the keeper rename, 2026-09: every outcome post failed and the
+# watcher hot-looped on retries). The re-summon never depended on the mention:
+# the watcher lets its own job-outcome posts through by content match.
+me_pub=""
+if command -v nak >/dev/null 2>&1; then
+    job_key="${BUZZ_PRIVATE_KEY:-$(cat "$HOME/.buzz/agents/$AGENT_NAME-bot.key" 2>/dev/null)}"
+    [ -n "$job_key" ] && me_pub="$(nak key public "$job_key" 2>/dev/null)"
+fi
 
 field() { sed -n "s/^$2=//p" "$1" | tail -1; }
 
@@ -35,6 +49,11 @@ field() { sed -n "s/^$2=//p" "$1" | tail -1; }
 check() {
     for job in "$JOBS"/*.job; do
         [ -f "$job" ] || continue
+        # A failed post retries with linear backoff (attempts * BACKOFF_BASE) and is
+        # given up on after MAX_SEND_ATTEMPTS - a permanently failing send must not
+        # retry every poll cycle forever. The give-up is recorded in gave-up.log.
+        now="$(date +%s)"; next="$(field "$job" next)"
+        [ -n "$next" ] && [ "$next" -gt "$now" ] && continue
         rc="$(cat "${job%.job}.rc" 2>/dev/null)"
         if [ -z "$rc" ]; then
             # ponytail: pid liveness only. A recycled pid keeps a dead job looking
@@ -50,14 +69,26 @@ check() {
         fi
         channel="$(field "$job" channel)"; thread="$(field "$job" thread)"
         if "$BUZZ" messages send --channel "$channel" --reply-to "$thread" \
-             --content "$msg" >/dev/null 2>&1; then
+             ${me_pub:+--mention "$me_pub"} --content "$msg" >/dev/null 2>&1; then
             rm -f "$job" "${job%.job}.rc"
             # Drop the hourglass only once nothing else is outstanding on this thread,
             # or the first of two builds to finish would report the thread as idle.
             grep -lF "thread=$thread" "$JOBS"/*.job >/dev/null 2>&1 ||
                 "$BUZZ" reactions remove --event "$thread" --emoji '⏳' >/dev/null 2>&1 || true
         else
-            echo "[$AGENT_NAME job] could not post the outcome of $job" >&2
+            attempts=$(( $(field "$job" attempts) + 1 ))
+            if [ "$attempts" -ge "$MAX_SEND_ATTEMPTS" ]; then
+                { printf '%s thread=%s label=%s attempts=%s msg=%s\n' \
+                    "$(date +%s)" "$thread" "$label" "$attempts" "$msg"; } >> "$JOBS/gave-up.log"
+                rm -f "$job" "${job%.job}.rc"
+                grep -lF "thread=$thread" "$JOBS"/*.job >/dev/null 2>&1 ||
+                    "$BUZZ" reactions remove --event "$thread" --emoji '⏳' >/dev/null 2>&1 || true
+                echo "[$AGENT_NAME job] gave up posting the outcome of \"$label\" after $attempts attempts (recorded in $JOBS/gave-up.log)" >&2
+            else
+                wait=$(( attempts * BACKOFF_BASE ))
+                printf 'attempts=%s\nnext=%s\n' "$attempts" "$(( now + wait ))" >> "$job"
+                echo "[$AGENT_NAME job] post failed (attempt $attempts/$MAX_SEND_ATTEMPTS), retrying in ${wait}s" >&2
+            fi
         fi
     done
 }

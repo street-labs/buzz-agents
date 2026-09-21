@@ -12,13 +12,26 @@ JOBS="$HOME/.buzz/agents/builder/jobs"
 mkdir -p "$HOME/.buzz/agents/builder"
 
 # stand-in for the buzz CLI: records what would have been posted
+# FAIL_MENTIONS=1 makes any send without an explicit --mention fail, like the
+# relay does when an @token does not resolve to a channel member.
 mkdir -p "$T/bin"
 cat > "$T/bin/buzz" <<'INNER'
 #!/bin/sh
 if [ "$1" = reactions ]; then
     echo "reaction $2 $6" >> "$SENT"       # reactions add|remove --event <id> --emoji <e>
 else
-    shift 7                                # messages send --channel <c> --reply-to <t> --content
+    shift 2                                # messages send
+    mention=""; while [ $# -gt 0 ]; do
+        case "$1" in
+            --mention) mention="$2"; shift 2 ;;
+            --content) shift; break ;;
+            *) shift ;;
+        esac
+    done                                   # $1 is now the content
+    if [ -n "$FAIL_MENTIONS" ] && [ -z "$mention" ]; then
+        echo '{"error":"relay_error","message":"@builder does not match a current channel member"}'
+        exit 2
+    fi
     echo "$1" >> "$SENT"
 fi
 INNER
@@ -92,4 +105,42 @@ bash "$JOB" --check
 posted "reaction remove" || fail "never cleared the waiting reaction"
 [ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 0 ] || fail "left a job file behind"
 
-echo "PASS"; rm -rf "$T"
+# 9. an @token that does not resolve (profile-name drift, the keeper rename) must not
+#    fail the post: the agent's own pubkey goes out as an explicit --mention, which the
+#    relay treats as identity, making the @Name text presentation-only.
+export FAIL_MENTIONS=1
+bash "$JOB" --label renamed -- true >/dev/null
+sleep 1
+bash "$JOB" --check
+posted 'job "renamed" finished rc=0' || fail "unresolvable @Name broke the outcome post"
+[ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 0 ] || fail "left a job file behind"
+
+# 10. a send that stays broken retries with backoff, then gives up with a durable
+#     record - it must not retry every poll cycle forever (keeper burned ~3h CPU).
+unset FAIL_MENTIONS
+cat > "$T/bin/buzz" <<'INNER'
+#!/bin/sh
+[ "$1" = messages ] && exit 2          # sends always fail; reactions still work
+if [ "$1" = reactions ]; then echo "reaction $2 $6" >> "$SENT"; fi
+exit 0
+INNER
+chmod +x "$T/bin/buzz"
+export MAX_JOB_SEND_ATTEMPTS=3 JOB_BACKOFF_BASE=0
+bash "$JOB" --label broken -- true >/dev/null
+sleep 1
+bash "$JOB" --check; bash "$JOB" --check; bash "$JOB" --check
+[ -f "$JOBS/gave-up.log" ] && grep -q 'label=broken' "$JOBS/gave-up.log" || fail "no durable give-up record"
+[ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 0 ] || fail "gave-up job was not forgotten"
+posted "reaction remove" || fail "never cleared the waiting reaction after giving up"
+
+# 11. backoff actually defers: a failed check records a future retry window, and
+#     later checks stay quiet until it passes
+export MAX_JOB_SEND_ATTEMPTS=3 JOB_BACKOFF_BASE=9999
+bash "$JOB" --label deferred -- true >/dev/null
+sleep 1
+bash "$JOB" --check
+[ "$(ls "$JOBS"/*.job 2>/dev/null | wc -l)" -eq 1 ] || fail "lost the backed-off job"
+posted 'job "deferred"' && fail "retried while backed off"
+[ -n "$(sed -n 's/^next=//p' "$JOBS"/*.job)" ] || fail "failed check did not record a retry window"
+
+ echo "PASS"; rm -rf "$T"
