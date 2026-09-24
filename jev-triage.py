@@ -16,14 +16,32 @@ Config via env:
     TYPESAFE_API_KEY          or ~/.typesafe/key
     TYPESAFE_API_URL          override for tests (default prod endpoint)
     JEV_CONF_MIN              min route confidence to act (default 0.8)
+    JEV_TRIAGE_LOG            jsonl log path (default jev-triage.jsonl next to this script)
+
+Every completed call is logged (verdict or failure) so triage quality can be
+audited later; log failures never affect the fail-open behavior.
 """
 import json
 import os
 import sys
 import urllib.request
+from datetime import datetime, timezone
 
 ENDPOINT = os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone")
 CONF_MIN = float(os.environ.get("JEV_CONF_MIN", "0.8"))
+JEV_LOG = os.environ.get(
+    "JEV_TRIAGE_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev-triage.jsonl"),
+)
+
+
+def log(entry):
+    """Append one jsonl line; best-effort, never blocks the verdict."""
+    try:
+        with open(JEV_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 def ask(content, name="", roster_file=""):
@@ -99,10 +117,15 @@ def main():
     try:
         v = verdict(ask(content, name, roster))
     except Exception as e:
+        log({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "agent": name, "ran": False, "error": str(e)[:200]})
         print(f"jev-triage: {e}", file=sys.stderr)
         sys.exit(1)
     # Low confidence on an ambiguous message = fall back to existing behavior.
-    if v["route"] != "ignore" or v["confidence"] < CONF_MIN:
+    acted = v["route"] == "ignore" and v["confidence"] >= CONF_MIN
+    log({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+         "agent": name, "ran": True, **v, "acted": acted})
+    if not acted:
         sys.exit(1)
     print(json.dumps(v))
 
