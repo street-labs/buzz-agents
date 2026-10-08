@@ -77,7 +77,7 @@ for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     [ "$(cat "$marker" 2>/dev/null)" = "$head_sha" ] && continue
 
     log "warming $slot at ${head_sha:0:8}"
-    if ! ( cd "$slot" && git checkout -q --detach "$head_sha" && git reset -q --hard "$head_sha" && git clean -qfd ); then
+    if ! ( cd "$slot" && git checkout -q --detach "$head_sha" && git reset -q --hard "$head_sha" && git clean -qfd && rm -rf .artifacts ); then
         log "could not reset $slot, skipping"
         continue
     fi
