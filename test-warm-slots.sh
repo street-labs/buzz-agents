@@ -50,10 +50,14 @@ echo "ok: already-warm slot is left alone"
 # main moves on: the slot is due again
 echo change >> "$T/repo/a.txt"
 git -C "$T/repo" commit -qam "move main"; git -C "$T/repo" push -q origin main
+# the last thread's proof artifacts, ignored the way a project's exclude ignores them
+echo ".artifacts/" >> "$(git -C "$T/repo" rev-parse --git-common-dir)/info/exclude"
+mkdir -p "$WT/builder-slot-0/.artifacts/sr1"; echo png > "$WT/builder-slot-0/.artifacts/sr1/shot.png"
 : > "$WARM_RAN_LOG"
 WARM_FORCE=1 sh "$WARM" builder >/dev/null 2>&1
 ran "$WT/builder-slot-0" || fail "did not rewarm after main moved"
-echo "ok: rewarms once main moves"
+[ -e "$WT/builder-slot-0/.artifacts" ] && fail "left the previous thread's .artifacts in the slot"
+echo "ok: rewarms once main moves, and drops .artifacts"
 
 # a dirty slot is never reset out from under anyone
 : > "$WARM_RAN_LOG"

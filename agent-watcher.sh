@@ -905,7 +905,8 @@ create_worktree() {
   if wt_path="$(claim_free_slot "$base_dir" "$root")"; then
     old_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "")"
     # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
-    # output, which is the entire point of recycling the slot.
+    # output, which is the entire point of recycling the slot. .artifacts/ is the
+    # one ignored dir that belongs to the old thread, not the build, so it goes too.
     ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 ) || true
     # A thread that lost its slot gets put back on its own branch, not origin/main.
     if prior="$(resurrect_branch "$root")"; then
@@ -914,7 +915,7 @@ create_worktree() {
     fi
     if ! ( git -C "$wt_path" checkout -B "$branch" "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
-           git -C "$wt_path" clean -fd >/dev/null 2>&1 ); then
+           git -C "$wt_path" clean -fd >/dev/null 2>&1 && rm -rf "$wt_path/.artifacts" ); then
       echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
       del_worktree "$root"  # release the reservation; the slot did not get reset
       wt_path=""
@@ -994,6 +995,7 @@ cleanup_worktree() {
         # be reclaimed.
         git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 || true
         git -C "$wt_path" clean -fd >/dev/null 2>&1 || true
+        rm -rf "$wt_path/.artifacts"
         ;;
       *)
         ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
