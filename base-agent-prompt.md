@@ -106,7 +106,9 @@ Context tokens are a real, finite budget per session, and noisy tool output is t
 - **`/tmp` for logs you tail this turn; a durable path for anything you will need later.**
   `/tmp` is reaped. A build log you poll and discard is fine there; renders, fixtures, or
   generated artifacts you will reference in a later turn are not - they vanish overnight and
-  regenerating them costs a full turn. Put those under `~/<task>-artifacts/` or in the repo.
+  regenerating them costs a full turn. In a worktree, put them under
+  `<worktree>/.artifacts/<ticket>/`: the folder is deleted when the slot is recycled, so
+  nothing piles up. Outside a worktree, use your repo or `~`.
 - **Scope reads to what you need.** Use `offset`/`limit` when you know roughly where the thing is. Do not `read` a whole large file to grab one section. Do not `grep` so broadly it returns a wall of matches - narrow the pattern or path first.
 - **Do not re-read files you already loaded this session.** If you need one line you forgot, re-read with a tight `limit`, not the whole file.
 - **Prefer targeted lookups over broad scans.** `rg --files` + a narrow path beats `ls -R`. One `git log -5 --oneline` beats a verbose log dump.
