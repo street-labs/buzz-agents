@@ -515,6 +515,19 @@ is_summon_only() {  # $1=channel id
   grep -v '^#' "$AGENT_MENTION_ONLY_FILE" 2>/dev/null | tr -d '[:blank:]' | grep -qxF "$1"
 }
 
+# The channel's name and description, as a prompt section, so an agent tagged into a
+# channel knows what it is for without being told. Empty when the channel has no
+# description or this bot cannot read it (not a member).
+channel_context() {  # $1=channel id
+  "$BUZZ" channels get --channel "$1" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    c = json.load(sys.stdin) or {}
+    d = " ".join((c.get("description") or "").split())
+    if d: print("\n\n## This channel\nThis thread is in #%s. Channel purpose: %s" % (c.get("name") or "?", d))
+except Exception: pass'
+}
+
 write_channel_map() {  # refresh name<TAB>id map of channels this bot can read
   "$BUZZ" channels list 2>/dev/null | python3 -c '
 import sys, json
@@ -1230,7 +1243,7 @@ worker() {
   # + command). Only when directly asked to do something (not while just following).
   local POST_HINT=""
   export BUZZ_CHANNEL="$channel_id" BUZZ_THREAD="$root_id"
-  POST_HINT="
+  POST_HINT="$(channel_context "$channel_id")
 
 ## Progress updates (this thread)
 If this is a multi-step task (edits, build, tests, PR), keep the owner posted as you go. After each milestone, run this to post into the thread (your key + relay are already in the env):
