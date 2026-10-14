@@ -403,6 +403,24 @@ for m in msgs:
     print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + str(int(threaded)) + "\t" + str(int(bool(directly))))
 '
 
+# Every message in a thread up to and including the one being handled: they are all in
+# this turn's prompt, so they count as answered. Without this an untagged message skipped
+# in a muted thread stayed unseen, and once a re-tag put the thread back in threads.txt
+# the next poll answered it a second time as "following".
+# Usage: printf '%s' "$THREAD_JSON" | python3 -c "$EARLIER_IN_THREAD" <msg_id>
+EARLIER_IN_THREAD='
+import sys, json
+try:
+    msgs = json.load(sys.stdin)
+except Exception:
+    msgs = []
+cut = next((m.get("created_at", 0) for m in msgs if m.get("id") == sys.argv[1]), None)
+if cut is not None:
+    for m in msgs:
+        if m.get("id") and m.get("created_at", 0) <= cut:
+            print(m["id"])
+'
+
 FORMAT_CONTEXT='
 import sys, json
 owner = sys.argv[1]; me = sys.argv[2]; myname = sys.argv[3]
@@ -1286,6 +1304,17 @@ It posts the exit code into this thread when the job ends, which re-summons you.
   # /fresh: start clean - no thread history in the prompt. The agent reads the spec
   # from disk in the worktree instead of carrying the discovery conversation forward.
   [ "${fresh_mode:-0}" = "1" ] && THREAD_JSON="[]"
+  if [ "$THREAD_JSON" != "[]" ]; then
+    earlier="$(printf '%s' "$THREAD_JSON" | python3 -c "$EARLIER_IN_THREAD" "$msg_id" 2>/dev/null)"
+    if [ -n "$earlier" ]; then
+      (
+        flock 200
+        printf '%s\n' "$earlier" | while IFS= read -r eid; do
+          grep -qxF "$eid" "$SEEN" 2>/dev/null || echo "$eid" >> "$SEEN"
+        done
+      ) 200>"$SEEN.lock"
+    fi
+  fi
   CURRENT_JSON="$(get_msg_by_id "$msg_id" "$msgs")"
   [ -z "$CURRENT_JSON" ] && CURRENT_JSON="$(printf '%s' "$content" | python3 -c "
 import sys, json
