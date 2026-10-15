@@ -26,7 +26,9 @@ set_worktree() {
   ) 200>"$WORKTREES.lock"
 }
 # functions under test, extracted verbatim
-eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^reserve_slot() {/,/^}/p;/^claim_new_slot() {/,/^}/p;/^del_worktree() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^thread_alive() {/,/^}/p;/^slot_is_stale() {/,/^}/p;/^reserve_slot() {/,/^}/p;/^claim_new_slot() {/,/^}/p;/^del_worktree() {/,/^}/p;/^claim_free_slot() {/,/^}/p;/^sweep_orphan_slots() {/,/^}/p' "$WATCHER")"
+# thread_alive reads $WORKERS/<root>.pid; no workers dir here means every thread is dead.
+WORKERS=$T/state/workers; mkdir -p "$WORKERS"
 eval "$(sed -n '/^create_worktree() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
@@ -115,5 +117,49 @@ a="$(get_worktree $rA)"; b="$(get_worktree $rB)"
 [ -d "$a" ] && [ -d "$b" ] || fail "concurrent claims handed back non-directories ($a / $b)"
 [ "$a" != "$b" ] || fail "concurrent claims got the same slot: $a"
 echo "ok: concurrent claims got distinct slots ($a / $b)"
+
+# A tracked slot whose thread is DEAD (no live worker pid) and gone quiet IS
+# reclaimable at the stale tier; the dead thread's row is evicted in the same claim.
+r3=deadbeefdeadbeef
+w11=$(create_worktree $r3 2>/dev/null)
+[ -n "$(flock "$WORKTREES" awk -F'\t' -v r="$r3" '$1==r' "$WORKTREES")" ] || fail "no row for $r3"
+echo tracked-change >> "$w11/a.txt"; git -C "$w11" add -A; git -C "$w11" commit -qm "tracked work"
+find "$w11" -type f -not -path '*/.git/*' -exec touch -t 202001010000 {} + 2>/dev/null
+w12=$(create_worktree cafebabecafebabe 2>/dev/null)
+[ "$w12" = "$w11" ] || fail "stale tracked slot with dead thread not reclaimed, got $w12"
+flock "$WORKTREES" grep -q "$r3" "$WORKTREES" && fail "dead thread's row survived the reclaim"
+flock "$WORKTREES" grep -q cafebabecafebabe "$WORKTREES" || fail "claimer's row not written"
+# dead thread's committed work survives on its branch
+git -C "$w12" rev-parse --verify "agent/builder-deadbeef" >/dev/null 2>&1 || fail "dead thread's branch lost"
+git -C "$w12" log -1 --format=%s "agent/builder-deadbeef" | grep -q "tracked work" || fail "dead thread's commit lost"
+echo "ok: tracked slot with dead thread reclaimed, row evicted, work kept on its branch"
+
+# ...but a tracked slot whose thread has a LIVE worker pid is never touched.
+r4=livebeeflivebeef
+w13=$(create_worktree $r4 2>/dev/null)
+echo $$ > "$WORKERS/root-$r4.pid"
+echo live-change >> "$w13/a.txt"; git -C "$w13" add -A; git -C "$w13" commit -qm "live work"
+find "$w13" -type f -not -path '*/.git/*' -exec touch -t 202001010000 {} + 2>/dev/null
+w14=$(create_worktree feedfacefeedface 2>/dev/null)
+[ "$w14" = "$w13" ] && fail "stole a slot from a live thread"
+rm -f "$WORKERS/root-$r4.pid"
+echo "ok: live thread's tracked slot not touched (got $w14)"
+
+# Orphan sweep: a slot dir with NO worktrees.tsv row is torn down; dirty work is
+# parked on the branch; dirs with a row (tracked or reserving) are untouched.
+r5=0rphan0000aaaa
+w15=$(create_worktree $r5 2>/dev/null)
+echo orphan-work > "$w15/orphan.txt"   # uncommitted, should be parked
+w16=$(create_worktree keepme00112233 2>/dev/null)   # stays tracked, must survive
+flock "$WORKTREES" awk -F'\t' -v r="$r5" '$1!=r' "$WORKTREES" > "$tmp"; mv "$tmp" "$WORKTREES"
+branch15=$(git -C "$w15" branch --show-current)
+sweep_orphan_slots >/dev/null 2>&1
+[ -d "$w15" ] && fail "orphan slot dir not torn down"
+[ -d "$w16" ] || fail "sweep tore down a tracked slot"
+flock "$WORKTREES" grep -q keepme00112233 "$WORKTREES" || fail "sweep removed a tracked row"
+git -C "$AGENT_REPO" rev-parse --verify "$branch15" >/dev/null 2>&1 || fail "orphan sweep lost the branch"
+git -C "$AGENT_REPO" log -1 --format=%s "$branch15" | grep -q "WIP: parked by watcher orphan sweep" || fail "orphan sweep did not park uncommitted work"
+git -C "$AGENT_REPO" cat-file -p "$branch15:orphan.txt" | grep -q orphan-work || fail "parked orphan file missing"
+echo "ok: orphan slot swept, uncommitted work parked on $branch15, tracked slots untouched"
 
 echo "ALL PASS"
