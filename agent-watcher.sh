@@ -1513,7 +1513,7 @@ import sys
 
 text = open(sys.argv[1]).read()
 actions = []
-pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact|mute|wait)(?::\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
+pattern = re.compile(r"^\s*\[\[WATCHER:\s*(fresh|compact|mute|wait)(?:[:\s]\s*(.*?))?\]\]\s*$", re.IGNORECASE | re.MULTILINE)
 
 def replace(match):
     if not actions:
@@ -1538,10 +1538,12 @@ PY
     # [[WATCHER: wait ~20m reason]] = machine-readable bounded-wait declaration.
     stall_wait_secs=0
     if [ "$watcher_action" = "wait" ]; then
-      wn="$(printf '%s' "$watcher_action_instructions" | grep -oE '[0-9]+' | head -1)"
-      case "$watcher_action_instructions" in
-        *h*) stall_wait_secs=$(( ${wn:-0} * 3600 )) ;;
-        *m*) stall_wait_secs=$(( ${wn:-0} * 60 )) ;;
+      # Read the unit next to the number: the reason text ("the build") has h's too.
+      wu="$(printf '%s' "$watcher_action_instructions" | grep -oiE '[0-9]+ *[hm]' | head -1)"
+      wn="${wu//[^0-9]/}"
+      case "$wu" in
+        *[hH]) stall_wait_secs=$(( ${wn:-0} * 3600 )) ;;
+        *[mM]) stall_wait_secs=$(( ${wn:-0} * 60 )) ;;
         *)   stall_wait_secs="$STALL_DEFAULT_WAIT" ;;
       esac
       [ "$stall_wait_secs" -gt 0 ] || stall_wait_secs="$STALL_DEFAULT_WAIT"
