@@ -837,6 +837,8 @@ resurrect_branch() {
 #
 # A slot the current thread list still claims is never touched at either tier.
 SLOT_STALE_DAYS="${SLOT_STALE_DAYS:-3}"
+# How often the periodic prune (boot prune + orphan sweep) re-runs in the main loop.
+PRUNE_INTERVAL="${PRUNE_INTERVAL:-600}"
 
 slot_is_stale() {
   # No file modified inside the window. -mtime, not -newermt: find here may be
@@ -890,11 +892,37 @@ del_worktree() {  # drop a root's row (releases a reservation the caller abandon
   ) 200>"$WORKTREES.lock"
 }
 
+# The row-holder thread of a tracked slot, or empty if no row names $1=slot.
+tracked_slot_root() {
+  flock "$WORKTREES" awk -F'\t' -v s="$1" '$2==s{print $1; exit}' "$WORKTREES"
+}
+
+# True if the thread owning $1=slot still has a live worker (its root-*.pid exists
+# and the pid is running). A row whose thread is gone is reclaimable by the
+# stale tier; without this check a slot whose thread never opened a PR is held
+# forever, because cleanup_worktree only releases rows on MERGED/CLOSED.
+tracked_slot_thread_alive() {  # $1=slot
+  local row_root pidfile
+  row_root="$(tracked_slot_root "$1")"
+  [ -n "$row_root" ] || return 1
+  pidfile="$WORKERS/root-$row_root.pid"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+}
+
 claim_free_slot() {
-  local base_dir="$1" root="$2" slot stale_candidate=""
+  local base_dir="$1" root="$2" slot stale_candidate="" tracked_stale_candidate=""
   for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     [ -d "$slot" ] || continue
-    grep -qF "	$slot	" "$WORKTREES" && continue  # fast path; reserve_slot is the real gate
+    if grep -qF "	$slot	" "$WORKTREES"; then
+      # Tracked slot: skipped by the fresh tier, but the stale tier may take it
+      # once its thread is gone and the tree has gone quiet. Untracked stale
+      # candidates are preferred so a tracked slot is only touched when no
+      # rowless slot qualifies.
+      if [ -z "$tracked_stale_candidate" ] && slot_is_stale "$slot" && ! tracked_slot_thread_alive "$slot"; then
+        tracked_stale_candidate="$slot"
+      fi
+      continue  # fast path; reserve_slot is the real gate
+    fi
 
     if [ -z "$(git -C "$slot" status --porcelain 2>/dev/null)" ] &&
        [ -z "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ]; then
@@ -906,7 +934,28 @@ claim_free_slot() {
     [ -z "$stale_candidate" ] && slot_is_stale "$slot" && stale_candidate="$slot"
   done
 
+  [ -n "$stale_candidate" ] || stale_candidate="$tracked_stale_candidate"
   [ -n "$stale_candidate" ] || return 1
+
+  # Reclaiming a tracked slot means retiring its row first; under one flock so a
+  # row we just decided was dead cannot sneak a fresh reservation in between.
+  if [ -n "$(tracked_slot_root "$stale_candidate")" ]; then
+    local tmp row_root
+    row_root="$(tracked_slot_root "$stale_candidate")"
+    tmp="$(mktemp)"
+    (
+      flock 200
+      grep -qF "	$stale_candidate	" "$WORKTREES" || exit 1
+      awk -F'\t' -v r="$row_root" '$1!=r' "$WORKTREES" > "$tmp" 2>/dev/null || true
+      printf '%s	%s	reserving	\n' "$root" "$stale_candidate" >> "$tmp"
+      mv "$tmp" "$WORKTREES"
+    ) 200>"$WORKTREES.lock" || return 1
+    # The flock block already wrote our reservation row; reserve_slot would
+    # bounce off it, so the slot is ours.
+    echo "[$AGENT_NAME] reclaiming stale slot $stale_candidate (work kept on $(git -C "$stale_candidate" branch --show-current 2>/dev/null))" >&2
+    echo "$stale_candidate"
+    return 0
+  fi
   reserve_slot "$stale_candidate" "$root" || return 1
 
   # Park uncommitted work on the branch so reusing the path cannot lose it.
@@ -1053,7 +1102,38 @@ prune_worktrees() {
     [ -n "$root" ] || continue
     cleanup_worktree "$root" && n=$((n + 1))
   done < "$WORKTREES"
-  echo "[$AGENT_NAME] boot prune swept $n tracked worktrees"
+  sweep_orphan_slot_dirs
+  echo "[$AGENT_NAME] prune swept $n tracked worktrees"
+}
+
+# Sweep slot directories that no worktrees.tsv row claims (orphaned by a crashed
+# watcher, manual deletion of the state file, or a worktree add that never wrote
+# its row). These were the bulk of the coffee-shop 320 GB pileup: invisible to
+# prune_worktrees, which iterates only rows, and skipped by claim_free_slot only
+# one path at a time. Same safety rules as the stale tier: a clean tree with
+# nothing unpushed is reset to origin/main so the slot is claimable; anything
+# else is left untouched - nothing is ever deleted, it just stops holding space
+# hostage.
+sweep_orphan_slot_dirs() {
+  local repo_name base_dir slot n=0
+  repo_name="$(basename "$AGENT_REPO")"
+  base_dir="$(dirname "$AGENT_REPO")/${repo_name}-worktrees"
+  [ -d "$base_dir" ] || return 0
+  for slot in "$base_dir/$AGENT_NAME-slot-"*; do
+    [ -d "$slot" ] || continue
+    grep -qF "	$slot	" "$WORKTREES" && continue
+    if [ -z "$(git -C "$slot" status --porcelain 2>/dev/null)" ] &&
+       [ -z "$(git -C "$slot" log --oneline HEAD --not --remotes 2>/dev/null)" ]; then
+      git -C "$slot" reset --hard origin/main >/dev/null 2>&1 || \
+        git -C "$slot" reset --hard >/dev/null 2>&1 || true
+      git -C "$slot" clean -fd >/dev/null 2>&1 || true
+      echo "[$AGENT_NAME] swept orphan slot dir $slot (no worktrees.tsv row)"
+      n=$((n + 1))
+    else
+      echo "[$AGENT_NAME] orphan slot $slot holds work, skipping sweep"
+    fi
+  done
+  [ "$n" -eq 0 ] || echo "[$AGENT_NAME] orphan sweep reset $n slot dir(s)"
 }
 
 # Detect if reply signals thread completion
@@ -1997,12 +2077,23 @@ done
 "$BUZZ" users set-presence --status online >/dev/null 2>&1 || true
 write_channel_map
 prune_worktrees
+last_prune=$(date +%s)
 echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} workers=0/$MAX_WORKERS channels=$(list_channel_ids | tr '\n' ' ')"
 
 while true; do
   spawned_roots=" "   # roots dispatched THIS poll cycle (space-delimited)
   stall_check
   [ -x "$AGENT_JOB" ] && "$AGENT_JOB" --check
+
+  # Periodic prune, not just at boot: a long-running watcher never re-checked
+  # slots whose PR merged after startup, so threads that resolved post-boot held
+  # their slots until the next restart. Cheap in the steady state: one gh pr view
+  # per tracked worktree, and the orphan sweep only touches rowless dirs.
+  now=$(date +%s)
+  if [ $((now - last_prune)) -ge "$PRUNE_INTERVAL" ]; then
+    last_prune=$now
+    prune_worktrees
+  fi
 
   # Wait if at max worker capacity
   while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do
