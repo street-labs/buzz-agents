@@ -403,10 +403,10 @@ for m in msgs:
     print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + str(int(threaded)) + "\t" + str(int(bool(directly))))
 '
 
-# Every message in a thread up to and including the one being handled: they are all in
-# this turn's prompt, so they count as answered. Without this an untagged message skipped
-# in a muted thread stayed unseen, and once a re-tag put the thread back in threads.txt
-# the next poll answered it a second time as "following".
+# Every message in the thread as fetched for this turn: they are all in this turn's
+# prompt, newer ones included, so they count as answered. Without this an untagged
+# message skipped in a muted thread stayed unseen and was answered a second time after a
+# re-tag, and messages queued behind a long turn each got their own turn after it.
 # Usage: printf '%s' "$THREAD_JSON" | python3 -c "$EARLIER_IN_THREAD" <msg_id>
 EARLIER_IN_THREAD='
 import sys, json
@@ -414,10 +414,9 @@ try:
     msgs = json.load(sys.stdin)
 except Exception:
     msgs = []
-cut = next((m.get("created_at", 0) for m in msgs if m.get("id") == sys.argv[1]), None)
-if cut is not None:
+if any(m.get("id") == sys.argv[1] for m in msgs):
     for m in msgs:
-        if m.get("id") and m.get("created_at", 0) <= cut:
+        if m.get("id"):
             print(m["id"])
 '
 
@@ -1418,7 +1417,16 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
 
   # Record the timestamp of the message we're answering, so the next resume only pulls
   # messages newer than this (older history is already in the session).
-  cur_ts="$(printf '%s' "$CURRENT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created_at',0) or 0)" 2>/dev/null || echo 0)"
+  # The newest message in the fetched thread wins: it was in this prompt too.
+  cur_ts="$(CUR="$CURRENT_JSON" THR="$THREAD_JSON" python3 -c "
+import os, json
+ts = [0]
+for k in ('CUR', 'THR'):
+    try: v = json.loads(os.environ.get(k) or 'null')
+    except Exception: continue
+    for m in (v if isinstance(v, list) else [v] if isinstance(v, dict) else []):
+        ts.append(m.get('created_at', 0) or 0)
+print(max(ts))" 2>/dev/null || echo 0)"
   [ -n "$cur_ts" ] && [ "$cur_ts" != "0" ] && set_lastturn "$root_id" "$cur_ts"
 
   out_file="$(mktemp)"
