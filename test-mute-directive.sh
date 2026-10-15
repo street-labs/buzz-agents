@@ -33,4 +33,13 @@ check "bare fresh -> fallback text" '[[WATCHER: fresh]]' '{"reply": "Context lif
 # Empty reply with no directive: stays empty (the reply guard handles re-prompting).
 check "no directive, empty -> empty" '' '{"reply": "", "action": null}'
 
+# Wait takes a space after the action (the documented form) or a colon.
+check "wait with space -> parsed" 'building
+[[WATCHER: wait ~20m waiting on the build]]' '{"reply": "building", "action": {"action": "wait", "instructions": "~20m waiting on the build"}}'
+check "wait with colon -> parsed" 'building
+[[WATCHER: wait: 1h deploy]]' '{"reply": "building", "action": {"action": "wait", "instructions": "1h deploy"}}'
+check "compact with focus -> parsed" 'ok
+[[WATCHER: compact: keep the failing cmd]]' '{"reply": "ok", "action": {"action": "compact", "instructions": "keep the failing cmd"}}'
+check "unknown action -> not a directive" '[[WATCHER: muted]]' '{"reply": "[[WATCHER: muted]]", "action": null}'
+
 [ "$fail" = 0 ] && echo "all mute-directive tests passed" || exit 1
