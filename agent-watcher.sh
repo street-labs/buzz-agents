@@ -968,6 +968,31 @@ claim_free_slot() {
   echo "$stale_candidate"
 }
 
+# Build output that outlives the main it was built against goes bad: an incremental
+# build over three weeks of main failed on ambiguous types from a module that had
+# moved, and each hit cost a 45 minute clean rebuild. So when a
+# slot is recycled onto a main more than SLOT_BUILD_STALE_DAYS past the one it last
+# started from, drop its build dir. SLOT_BUILD_DIR names that dir, with {slot} for
+# the slot's basename (e.g. $HOME/dd/{slot}/Build); unset, this does nothing.
+# Only the products go: package checkouts and caches beside them stay warm.
+SLOT_BUILD_STALE_DAYS="${SLOT_BUILD_STALE_DAYS:-3}"
+
+drop_stale_build() {  # $1 = slot path, before its reset; $2 = the sha it moves to
+  local slot="$1" to="$2" dir gitdir from from_t to_t
+  [ -n "${SLOT_BUILD_DIR:-}" ] || return 0
+  dir="${SLOT_BUILD_DIR//\{slot\}/$(basename "$slot")}"
+  [ -d "$dir" ] || return 0
+  gitdir="$(git -C "$slot" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+  # The base recorded at the last recycle or warm; without one, what HEAD forked from.
+  from="$(cat "$gitdir/agent-base-sha" 2>/dev/null)"
+  [ -n "$from" ] || from="$(git -C "$slot" merge-base HEAD "$to" 2>/dev/null)"
+  from_t="$(git -C "$slot" log -1 --format=%ct "$from" 2>/dev/null)"
+  to_t="$(git -C "$slot" log -1 --format=%ct "$to" 2>/dev/null)"
+  [ -n "$from_t" ] && [ -n "$to_t" ] || return 0
+  [ $((to_t - from_t)) -gt $((SLOT_BUILD_STALE_DAYS * 86400)) ] || return 0
+  rm -rf "$dir" && echo "[$AGENT_NAME] dropped $dir: built against main $(( (to_t - from_t) / 86400 ))d behind" >&2
+}
+
 create_worktree() {
   local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n prior=""
   repo_name="$(basename "$AGENT_REPO")"
@@ -992,6 +1017,7 @@ create_worktree() {
       branch="$prior"
       echo "[$AGENT_NAME] resurrecting $root onto $branch" >&2
     fi
+    drop_stale_build "$wt_path" "$(git -C "$AGENT_REPO" rev-parse origin/main 2>/dev/null)"
     if ! ( git -C "$wt_path" checkout -B "$branch" "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" clean -fd >/dev/null 2>&1 && rm -rf "$wt_path/.artifacts" ); then
@@ -1005,6 +1031,7 @@ create_worktree() {
          [ -z "$(git -C "$wt_path" log --oneline "$old_branch" --not --remotes 2>/dev/null)" ]; then
         ( cd "$AGENT_REPO" && git branch -D "$old_branch" >/dev/null 2>&1 ) || true
       fi
+      git -C "$AGENT_REPO" rev-parse origin/main > "$(git -C "$wt_path" rev-parse --absolute-git-dir)/agent-base-sha" 2>/dev/null || true
       echo "[$AGENT_NAME] recycled slot: $wt_path (branch $branch)" >&2
     fi
   else
@@ -1143,6 +1170,13 @@ is_thread_resolved() {
   echo "$reply" | grep -qiE '(github\.com/[^/]+/[^/]+/pull/[0-9]+|^Done\.|Pushed to|PR #[0-9]+|Merged|✅.*complete)'
 }
 
+# A reply that hands the work to a human for review has finished the turn, whatever
+# its last line says: "ready for your review ... I'll check that run then" ended in
+# "then" and drew a stall alert on a turn that was over.
+is_review_handoff() {  # $1 = reply text
+  printf '%s' "$1" | grep -qiE "${STALL_HANDOFF_RE:-ready for (your )?review|for your review|over to you}"
+}
+
 stall_is_open_ended() {  # $1 = reply text
   local reply="$1" last
   last="$(printf '%s' "$reply" | grep -v '^[[:space:]]*$' | tail -1)"
@@ -1176,7 +1210,7 @@ stall_watch_record() {  # $1=root $2=channel $3=reply $4=declared_wait_secs
       case "$(printf '%s' "$v" | sed -n 's/.*"state":[[:space:]]*"\([a-z]*\)".*/\1/p')" in
         wip|blocked) keep=1 ;;
       esac
-    elif ! is_thread_resolved "$reply" && stall_is_open_ended "$reply"; then
+    elif ! is_thread_resolved "$reply" && ! is_review_handoff "$reply" && stall_is_open_ended "$reply"; then
       keep=1
     fi
   fi
