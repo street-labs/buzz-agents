@@ -41,7 +41,7 @@ bash -n agent-watcher.sh || { echo "FAIL: agent-watcher.sh does not parse"; exit
   python3 - <<'PY'
 import re
 s = open("agent-watcher.sh").read()
-for name in ["is_thread_resolved", "stall_is_open_ended", "stall_delete", "stall_watch_record"]:
+for name in ["is_thread_resolved", "is_review_handoff", "stall_is_open_ended", "stall_delete", "stall_watch_record"]:
     print(re.search(rf"^{name}\(\) \{{.*?^\}}", s, re.S | re.M).group(0))
 print(re.search(r"^STALL_ENDWORDS=.*$", s, re.M).group(0))
 PY
@@ -71,6 +71,7 @@ FAKE_VERDICT=       stall_watch_record r5 c1 "$DONE" 0;  check dropped "no jev v
 unset AGENT_JEV_STALL
                     stall_watch_record r6 c1 "$WIP" 0;   check armed   "jev off: regex fallback still arms"
                     stall_watch_record r7 c1 "$DONE" 60; check armed   "declared wait always arms"
+                    stall_watch_record r8 c1 "PR is draft and ready for your review. I'll check that run then" 0; check dropped "review handoff ends the turn"
 rm -rf "$T"
 [ "$fa" -eq 0 ] && echo "decision matrix: ok"
 exit "$fa"
