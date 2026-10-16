@@ -83,6 +83,7 @@ for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     fi
     if ( cd "$slot" && "$warm_cmd" ); then
         log "warmed $slot"
+        echo "$head_sha" > "$gitdir/agent-base-sha"   # read by drop_stale_build in agent-watcher.sh
     else
         log "warm failed for $slot"
     fi
