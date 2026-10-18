@@ -51,13 +51,16 @@ elapsed=$(( $(date +%s) - t0 ))
 sleep 1
 [ -z "$(ls "$JOBS"/repo-*tool-*.lock 2>/dev/null)" ] || fail "tool lock not released after holder exit"
 
-# a stale lock (holder died) is stolen, not waited on
+# a stale lock (holder died) is stolen, not waited on. Compute the lock name
+# exactly as agent-job.sh does (hash of the string, not a file path), so this
+# test cannot pass vacuously against a name the runner never uses.
 top="$(git -C "$T/repo" rev-parse --show-toplevel)"
 real_lock="$JOBS/repo-$(printf %s "$top" | md5 -q)-tool-xcodebuild.lock"
 rm -rf "$JOBS"/repo-*tool-*.lock; mkdir -p "$real_lock"; echo "pid=999999" > "$real_lock/pid"
 t0=$(date +%s)
 "$DIR/agent-job.sh" --label "steal" -- bash -c 'xcodebuild build' >/dev/null 2>&1
 sleep 2  # detached job needs a moment to steal the stale lock
+[ ! -f "$real_lock/pid" ] || fail "stale lock not stolen: $real_lock still present"
 elapsed=$(( $(date +%s) - t0 ))
 [ "$elapsed" -le 3 ] || fail "stale lock not stolen (waited ${elapsed}s)"
 

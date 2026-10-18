@@ -28,9 +28,8 @@ BUZZ="${BUZZ:-$(command -v buzz || echo "$HOME/.buzz/bin/buzz")}"
 MAX_SEND_ATTEMPTS="${MAX_JOB_SEND_ATTEMPTS:-10}"
 BACKOFF_BASE="${JOB_BACKOFF_BASE:-60}"
 mkdir -p "$JOBS"
-
-# md5 -q is macOS-only; fall back to md5sum on Linux so lock keys match per platform.
-hashstr() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+# (repo-hash helper lives inside the runner string below - the runner is a separate
+# bash -c child and cannot call functions defined here.)
 
 # Our pubkey. Passed as an explicit --mention below, it makes the literal
 # "@$AGENT_NAME" in the outcome text presentation-only - the relay rejects any
@@ -148,8 +147,11 @@ done
 tool="${c%% *}"
 tool="$(basename "$tool")"
 lock=""
+# Hash a STRING (not a file path - md5/md5sum error on directories). md5(1) -q is
+# macOS-only; fall back to md5sum on Linux. Inline here: the runner is its own
+# bash -c child and cannot call functions defined in the parent script.
 [ -n "$tool" ] && top="$(git rev-parse --show-toplevel 2>/dev/null)" \
-  && lock="$jobsdir/repo-$(hashstr "$top")-tool-${tool//[^A-Za-z0-9._-]/}.lock"
+  && lock="$jobsdir/repo-$(if command -v md5 >/dev/null 2>&1; then printf %s "$top" | md5 -q; else printf %s "$top" | md5sum | cut -d" " -f1; fi)-tool-${tool//[^A-Za-z0-9._-]/}.lock"
 if [ -n "$lock" ]; then
   while ! mkdir "$lock" 2>/dev/null; do
     p="$(sed -n "s/^pid=//p" "$lock/pid" 2>/dev/null)"
