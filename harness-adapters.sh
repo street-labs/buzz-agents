@@ -390,6 +390,7 @@ import sys, json
 RATES = {
     'z-ai/glm-5.2':              (1.586, 4.9165, 0.1506),
     'z-ai/glm-5.3':              (1.477, 4.642, 0.1477),
+    'z-ai/glm-5.3-flash':        (0.15825, 0.5275, 0.03165),  # fleet default since 2026-09-19
     'deepseek/deepseek-v4-pro':  (0.458925, 0.91785, 0),
     'deepseek/deepseek-v4-flash':(0.10339, 0.20678, 0),
     'deepseek/deepseek-v4-flash-0731':(0.10339, 0.20678, 0),
@@ -402,6 +403,8 @@ RATES = {
 }
 DEFAULT_RATE = (0, 0, 0)
 
+last_model = None
+
 total_cost = 0.0
 total_tokens = 0
 for line in open('$json_file'):
@@ -411,6 +414,7 @@ for line in open('$json_file'):
             msg = ev.get('message', {})
             usage = msg.get('usage', {})
             model_id = msg.get('model', '')
+            last_model = model_id
             inp, outp, cache_r = RATES.get(model_id, DEFAULT_RATE)
             t_in = usage.get('input', 0)
             t_out = usage.get('output', 0)
@@ -419,6 +423,10 @@ for line in open('$json_file'):
             total_cost += cost
             total_tokens += usage.get('totalTokens', 0)
     except: pass
+
+if last_model is not None and last_model not in RATES:
+    # Unknown model silently costs $0.00 -> cost reactions never fire. Make it loud.
+    print('WARNING: no PPQ rate for model %r in harness-adapters.sh RATES; cost tracked as 0' % last_model, file=sys.stderr)
 print(f'{total_cost}:{total_tokens}')
 " 2>/dev/null
       fi
