@@ -1265,6 +1265,19 @@ stall_check() {
     # job is already running (the 2026-10 coffee-shop thrash, runs 12-26). The job's
     # own outcome post re-summons the agent, so just push the deadline out.
     if job_live_for_thread "$root"; then
+      # Cap consecutive deferrals: a wedged-but-alive job would otherwise push the
+      # deadline forever and the MAX_STALL_RESUMES escalation would never fire.
+      dfile="$WORKERS/root-$root.defers"
+      defers=$(($(cat "$dfile" 2>/dev/null || echo 0) + 1))
+      echo "$defers" > "$dfile"
+      if [ "$defers" -ge "${MAX_STALL_DEFERS:-4}" ]; then
+        echo "[$AGENT_NAME] stall escalate $root: job live across $defers deferrals"
+        "$BUZZ" messages send --channel "$cid" --reply-to "$root" --mention "$OWNER" --content "Stall alert (watcher): a background agent-job on this thread has been live across $defers stall-check deferrals. It may be wedged - check the job or kill it." >/dev/null 2>&1 \
+          || echo "[$AGENT_NAME] stall escalation post failed for $root"
+        rm -f "$dfile"
+        stall_delete "$root"
+        continue
+      fi
       (
         flock 200
         deadline=$((now + STALL_MARGIN))
@@ -1272,9 +1285,10 @@ stall_check() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$root" "$cid" "$deadline" "$attempts" "$b64" >> "$STALL.tmp"
         mv "$STALL.tmp" "$STALL"
       ) 200>"$STALL.lock"
-      echo "[$AGENT_NAME] stall check: job live on $root - resume deferred"
+      echo "[$AGENT_NAME] stall check: job live on $root - resume deferred ($defers)"
       continue
     fi
+    rm -f "$WORKERS/root-$root.defers"
     attempts=$((attempts + 1))
     reply="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
     excerpt="$(printf '%s' "$reply" | tail -c 300 | tr '\n' ' ')"
