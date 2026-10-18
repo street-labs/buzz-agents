@@ -29,6 +29,9 @@ MAX_SEND_ATTEMPTS="${MAX_JOB_SEND_ATTEMPTS:-10}"
 BACKOFF_BASE="${JOB_BACKOFF_BASE:-60}"
 mkdir -p "$JOBS"
 
+# md5 -q is macOS-only; fall back to md5sum on Linux so lock keys match per platform.
+hashstr() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+
 # Our pubkey. Passed as an explicit --mention below, it makes the literal
 # "@$AGENT_NAME" in the outcome text presentation-only - the relay rejects any
 # @token that does not match a channel member, and AGENT_NAME can drift from the
@@ -146,7 +149,7 @@ tool="${c%% *}"
 tool="$(basename "$tool")"
 lock=""
 [ -n "$tool" ] && top="$(git rev-parse --show-toplevel 2>/dev/null)" \
-  && lock="$jobsdir/repo-$(printf %s "$top" | md5 -q)-tool-${tool//[^A-Za-z0-9._-]/}.lock"
+  && lock="$jobsdir/repo-$(hashstr "$top")-tool-${tool//[^A-Za-z0-9._-]/}.lock"
 if [ -n "$lock" ]; then
   while ! mkdir "$lock" 2>/dev/null; do
     p="$(sed -n "s/^pid=//p" "$lock/pid" 2>/dev/null)"

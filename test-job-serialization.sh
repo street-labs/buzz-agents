@@ -57,7 +57,7 @@ real_lock="$JOBS/repo-$(printf %s "$top" | md5 -q)-tool-xcodebuild.lock"
 rm -rf "$JOBS"/repo-*tool-*.lock; mkdir -p "$real_lock"; echo "pid=999999" > "$real_lock/pid"
 t0=$(date +%s)
 "$DIR/agent-job.sh" --label "steal" -- bash -c 'xcodebuild build' >/dev/null 2>&1
-for _ in $(seq 1 15); do [ -f "${JOBS%/jobs}" ] ; start=$(date +%s); [ $((start - t0)) -gt 0 ] && break; sleep 1; done
+sleep 2  # detached job needs a moment to steal the stale lock
 elapsed=$(( $(date +%s) - t0 ))
 [ "$elapsed" -le 3 ] || fail "stale lock not stolen (waited ${elapsed}s)"
 
