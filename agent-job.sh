@@ -123,7 +123,30 @@ log="${log:-$JOBS/$id.log}"
 #
 # The rc lands in its own file, never in the job file: the job file is written once and
 # moved into place, and a child appending to it would race that move.
-runner='log="$1"; rcf="$2"; shift 2; "$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"'
+#
+# Per-repo serialization: two concurrent sim jobs in the same repo race for the same
+# simulator and kill each other's xcodebuild runs (2026-10 coffee-shop, runs 12-26).
+# The runner holds a mkdir mutex keyed on the repo top-level and queues behind any
+# live holder; a dead holder's lock is stolen via pid liveness. The wait happens in
+# the detached job, not the agent's turn. Only sim/xcodebuild jobs take the lock -
+# unrelated jobs (deploys, waiting timers) run concurrently as before.
+# ponytail: substring match on the command, not a real dependency graph - widen the
+# pattern if another build tool starts contending for the simulator.
+runner='log="$1"; rcf="$2"; jobsdir="$3"; shift 3
+lock=""
+if printf %s "$*" | grep -iqE "xcodebuild|xcrun|simctl|simulator|uitest"; then
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" && lock="$jobsdir/repo-$(printf %s "$top" | md5 -q).lock"
+fi
+if [ -n "$lock" ]; then
+  while ! mkdir "$lock" 2>/dev/null; do
+    p="$(sed -n "s/^pid=//p" "$lock/pid" 2>/dev/null)"
+    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    sleep 10
+  done
+  echo "pid=$$" > "$lock/pid"
+  trap "rm -rf \"\$lock\"" EXIT
+fi
+"$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"'
 detach='import os, sys
 try:
     os.setsid()
@@ -131,9 +154,9 @@ except OSError:
     pass          # already a group leader, so already out of the caller group
 os.execvp(sys.argv[1], sys.argv[1:])'
 if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+    setsid bash -c "$runner" _ "$log" "${job%.job}.rc" "$JOBS" "$@" >/dev/null 2>&1 &
 else
-    python3 -c "$detach" bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+    python3 -c "$detach" bash -c "$runner" _ "$log" "${job%.job}.rc" "$JOBS" "$@" >/dev/null 2>&1 &
 fi
 
 printf 'channel=%s\nthread=%s\nlabel=%s\nlog=%s\npid=%s\n' \
