@@ -124,19 +124,29 @@ log="${log:-$JOBS/$id.log}"
 # The rc lands in its own file, never in the job file: the job file is written once and
 # moved into place, and a child appending to it would race that move.
 #
-# Per-repo serialization: two concurrent sim jobs in the same repo race for the same
-# simulator and kill each other's xcodebuild runs (2026-10 coffee-shop, runs 12-26).
-# The runner holds a mkdir mutex keyed on the repo top-level and queues behind any
-# live holder; a dead holder's lock is stolen via pid liveness. The wait happens in
-# the detached job, not the agent's turn. Only sim/xcodebuild jobs take the lock -
-# unrelated jobs (deploys, waiting timers) run concurrently as before.
-# ponytail: substring match on the command, not a real dependency graph - widen the
-# pattern if another build tool starts contending for the simulator.
+# Per-repo, per-tool serialization: two concurrent runs of the SAME tool in one repo
+# contend for shared state - a simulator, build cache, or package store - and kill
+# each other's runs (2026-10 coffee-shop, runs 12-26: two xcodebuilds, one sim). So a
+# job holds a mkdir mutex keyed on repo top-level + the tool it runs; a second job of
+# the same tool queues in the detached runner (never in the agent's turn), a dead
+# holder's lock is stolen via pid liveness, and different tools run concurrently.
+# Stack-agnostic: no tool list, the key is whatever binary the command invokes.
+# ponytail: first-token keying, not a dependency graph - `make ios-build` and
+# `make clean` queue behind each other. Key on targets too if that ever hurts.
 runner='log="$1"; rcf="$2"; jobsdir="$3"; shift 3
+c="$*"
+while :; do   # strip wrapper shells so `bash -c "xcodebuild ..."` keys on xcodebuild
+  case "$c" in
+    bash\ -c\ *|sh\ -c\ *|bash\ *|sh\ *|env\ *|setsid\ *|nohup\ *|nice\ *|sudo\ *|command\ *|timeout\ *|-c\ *|exec\ *)
+      c="${c#* }" ;;
+    *) break ;;
+  esac
+done
+tool="${c%% *}"
+tool="$(basename "$tool")"
 lock=""
-if printf %s "$*" | grep -iqE "xcodebuild|xcrun|simctl|simulator|uitest"; then
-  top="$(git rev-parse --show-toplevel 2>/dev/null)" && lock="$jobsdir/repo-$(printf %s "$top" | md5 -q).lock"
-fi
+[ -n "$tool" ] && top="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  && lock="$jobsdir/repo-$(printf %s "$top" | md5 -q)-tool-${tool//[^A-Za-z0-9._-]/}.lock"
 if [ -n "$lock" ]; then
   while ! mkdir "$lock" 2>/dev/null; do
     p="$(sed -n "s/^pid=//p" "$lock/pid" 2>/dev/null)"
