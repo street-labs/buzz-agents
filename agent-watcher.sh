@@ -237,6 +237,7 @@ LIMITED="$STATE/limited-until"                  # epoch until which the primary 
 # Stall watch: threads the agent left mid-commitment. root_id \t channel_id \t
 # deadline_epoch \t attempts \t base64(last reply). The stall checker resumes the
 # session when the deadline lapses and escalates to the owner after MAX_STALL_RESUMES.
+JOBS="$STATE/jobs"; mkdir -p "$JOBS"   # background agent-jobs (agent-job.sh), keyed by thread
 STALL="$STATE/stall.tsv"; touch "$STALL"
 STALL_MARGIN="${STALL_MARGIN:-600}"            # grace after a declared/heuristic wait, seconds
 STALL_DEFAULT_WAIT="${STALL_DEFAULT_WAIT:-900}" # heuristic match with no declared wait, seconds
@@ -1184,6 +1185,21 @@ stall_is_open_ended() {  # $1 = reply text
   printf '%s' "$last" | grep -qiE "(${STALL_ENDWORDS})[.!,:]?[[:space:]]*$"
 }
 
+# True while a background agent-job (agent-job.sh) is still running for this thread:
+# job file present, no rc yet, pid alive. A dead-pid job is not live - --check will
+# report it as killed, and the thread should get a resume, not silence.
+job_live_for_thread() {  # $1=root
+  local jf pid
+  for jf in "$JOBS"/*.job; do
+    [ -f "$jf" ] || continue
+    grep -qF "thread=$1" "$jf" 2>/dev/null || continue
+    [ -f "${jf%.job}.rc" ] && continue
+    pid="$(sed -n 's/^pid=//p' "$jf" | tail -1)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 stall_delete() {  # $1 = root_id
   (
     flock 200
@@ -1244,6 +1260,35 @@ stall_check() {
     [ "$deadline" -gt "$now" ] && continue
     # A live worker on this thread (a real mention, or a resume in flight) owns it.
     if [ -f "$WORKERS/root-$root.pid" ] && kill -0 "$(cat "$WORKERS/root-$root.pid" 2>/dev/null)" 2>/dev/null; then continue; fi
+    # Cap auto-resume while a background agent-job is live on this thread: resuming
+    # re-spawns the harness mid-job, and the resumed turn relaunches the build the
+    # job is already running (the 2026-10 coffee-shop thrash, runs 12-26). The job's
+    # own outcome post re-summons the agent, so just push the deadline out.
+    if job_live_for_thread "$root"; then
+      # Cap consecutive deferrals: a wedged-but-alive job would otherwise push the
+      # deadline forever and the MAX_STALL_RESUMES escalation would never fire.
+      dfile="$WORKERS/root-$root.defers"
+      defers=$(($(cat "$dfile" 2>/dev/null || echo 0) + 1))
+      echo "$defers" > "$dfile"
+      if [ "$defers" -ge "${MAX_STALL_DEFERS:-4}" ]; then
+        echo "[$AGENT_NAME] stall escalate $root: job live across $defers deferrals"
+        "$BUZZ" messages send --channel "$cid" --reply-to "$root" --mention "$OWNER" --content "Stall alert (watcher): a background agent-job on this thread has been live across $defers stall-check deferrals. It may be wedged - check the job or kill it." >/dev/null 2>&1 \
+          || echo "[$AGENT_NAME] stall escalation post failed for $root"
+        rm -f "$dfile"
+        stall_delete "$root"
+        continue
+      fi
+      (
+        flock 200
+        deadline=$((now + STALL_MARGIN))
+        grep -v "^$root$(printf '\t')" "$STALL" > "$STALL.tmp" 2>/dev/null || true
+        printf '%s\t%s\t%s\t%s\t%s\n' "$root" "$cid" "$deadline" "$attempts" "$b64" >> "$STALL.tmp"
+        mv "$STALL.tmp" "$STALL"
+      ) 200>"$STALL.lock"
+      echo "[$AGENT_NAME] stall check: job live on $root - resume deferred ($defers)"
+      continue
+    fi
+    rm -f "$WORKERS/root-$root.defers"
     attempts=$((attempts + 1))
     reply="$(printf '%s' "$b64" | base64 -d 2>/dev/null)"
     excerpt="$(printf '%s' "$reply" | tail -c 300 | tr '\n' ' ')"
@@ -1472,6 +1517,45 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
     # agents get an isolated per-thread worktree cut from fresh main.
     if [ -z "$work_dir" ]; then
       if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")"; fi
+    fi
+  fi
+
+  # One session per worktree, enforced: a mkdir mutex in the slot refuses a second
+  # live session in the same tree - two pi sessions in one worktree/simulator raced
+  # for hours and killed each other's xcodebuild runs (2026-10 coffee-shop). Slot
+  # worktrees only; direct-main agents intentionally share the main repo. A live
+  # holder blocks the newcomer (bounded); a dead holder's lock is stolen via pid
+  # liveness. ponytail: after the cap we proceed anyway rather than fail the turn -
+  # a wedged lock must not cost the thread its answer; per-holder watchdog if that
+  # ever actually bites.
+  SLOT_SESSION_WAIT="${SLOT_SESSION_WAIT:-600}"
+  _slot_lock=""
+  case "$(basename "$work_dir")" in
+    "$AGENT_NAME"-slot-*) _slot_lock="$work_dir/.buzz-session" ;;
+  esac
+  if [ -n "$_slot_lock" ]; then
+    local _slept=0 _holder
+    while ! mkdir "$_slot_lock" 2>/dev/null; do
+      _holder="$(sed -n 's/^pid=//p' "$_slot_lock/owner" 2>/dev/null)"
+      if [ -n "$_holder" ] && ! kill -0 "$_holder" 2>/dev/null; then
+        rm -rf "$_slot_lock"; continue   # stale lock: holder died without releasing
+      fi
+      if [ "$_slept" -ge "$SLOT_SESSION_WAIT" ]; then
+        echo "[$AGENT_NAME worker-$$] WARNING: session lock held by pid $_holder in $work_dir past ${SLOT_SESSION_WAIT}s - proceeding anyway" >&2
+        _slot_lock=""   # do not steal, do not release someone else's lock
+        break
+      fi
+      sleep 10; _slept=$((_slept + 10))
+    done
+    if [ -n "$_slot_lock" ]; then
+      printf 'root=%s\npid=%s\n' "$root_id" "$$" > "$_slot_lock/owner"
+      # Keep the lock out of git status: untracked dirt there trips the slot-stale
+      # checks and parks phantom "uncommitted work".
+      _gd="$(git -C "$work_dir" rev-parse --absolute-git-dir 2>/dev/null)" \
+        && { mkdir -p "$_gd/info"; grep -qxF '.buzz-session' "$_gd/info/exclude" 2>/dev/null \
+               || echo '.buzz-session' >> "$_gd/info/exclude"; }
+      trap 'rm -rf "'"$_slot_lock"'"' EXIT   # worker runs in its own subshell; fires on exit
+      echo "[$AGENT_NAME worker-$$] session lock taken on $work_dir (root $root_id)"
     fi
   fi
 

@@ -29,6 +29,9 @@ MAX_SEND_ATTEMPTS="${MAX_JOB_SEND_ATTEMPTS:-10}"
 BACKOFF_BASE="${JOB_BACKOFF_BASE:-60}"
 mkdir -p "$JOBS"
 
+# md5 -q is macOS-only; fall back to md5sum on Linux so lock keys match per platform.
+hashstr() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+
 # Our pubkey. Passed as an explicit --mention below, it makes the literal
 # "@$AGENT_NAME" in the outcome text presentation-only - the relay rejects any
 # @token that does not match a channel member, and AGENT_NAME can drift from the
@@ -123,7 +126,40 @@ log="${log:-$JOBS/$id.log}"
 #
 # The rc lands in its own file, never in the job file: the job file is written once and
 # moved into place, and a child appending to it would race that move.
-runner='log="$1"; rcf="$2"; shift 2; "$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"'
+#
+# Per-repo, per-tool serialization: two concurrent runs of the SAME tool in one repo
+# contend for shared state - a simulator, build cache, or package store - and kill
+# each other's runs (2026-10 coffee-shop, runs 12-26: two xcodebuilds, one sim). So a
+# job holds a mkdir mutex keyed on repo top-level + the tool it runs; a second job of
+# the same tool queues in the detached runner (never in the agent's turn), a dead
+# holder's lock is stolen via pid liveness, and different tools run concurrently.
+# Stack-agnostic: no tool list, the key is whatever binary the command invokes.
+# ponytail: first-token keying, not a dependency graph - `make ios-build` and
+# `make clean` queue behind each other. Key on targets too if that ever hurts.
+runner='log="$1"; rcf="$2"; jobsdir="$3"; shift 3
+c="$*"
+while :; do   # strip wrapper shells so `bash -c "xcodebuild ..."` keys on xcodebuild
+  case "$c" in
+    bash\ -c\ *|sh\ -c\ *|bash\ *|sh\ *|env\ *|setsid\ *|nohup\ *|nice\ *|sudo\ *|command\ *|timeout\ *|-c\ *|exec\ *)
+      c="${c#* }" ;;
+    *) break ;;
+  esac
+done
+tool="${c%% *}"
+tool="$(basename "$tool")"
+lock=""
+[ -n "$tool" ] && top="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  && lock="$jobsdir/repo-$(hashstr "$top")-tool-${tool//[^A-Za-z0-9._-]/}.lock"
+if [ -n "$lock" ]; then
+  while ! mkdir "$lock" 2>/dev/null; do
+    p="$(sed -n "s/^pid=//p" "$lock/pid" 2>/dev/null)"
+    if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$lock"; continue; fi
+    sleep 10
+  done
+  echo "pid=$$" > "$lock/pid"
+  trap "rm -rf \"\$lock\"" EXIT
+fi
+"$@" >"$log" 2>&1; printf "%s" "$?" > "$rcf"'
 detach='import os, sys
 try:
     os.setsid()
@@ -131,9 +167,9 @@ except OSError:
     pass          # already a group leader, so already out of the caller group
 os.execvp(sys.argv[1], sys.argv[1:])'
 if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+    setsid bash -c "$runner" _ "$log" "${job%.job}.rc" "$JOBS" "$@" >/dev/null 2>&1 &
 else
-    python3 -c "$detach" bash -c "$runner" _ "$log" "${job%.job}.rc" "$@" >/dev/null 2>&1 &
+    python3 -c "$detach" bash -c "$runner" _ "$log" "${job%.job}.rc" "$JOBS" "$@" >/dev/null 2>&1 &
 fi
 
 printf 'channel=%s\nthread=%s\nlabel=%s\nlog=%s\npid=%s\n' \
