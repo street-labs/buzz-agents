@@ -30,7 +30,9 @@ BACKOFF_BASE="${JOB_BACKOFF_BASE:-60}"
 mkdir -p "$JOBS"
 
 # md5 -q is macOS-only; fall back to md5sum on Linux so lock keys match per platform.
-hashstr() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+# hash a STRING (not a file path) - md5 -q/md5sum with a directory arg fails,
+# which yielded an empty lock suffix and one shared lock for all repos.
+hashstr() { printf %s "$1" | md5 -q 2>/dev/null || printf %s "$1" | md5sum | cut -d' ' -f1; }
 
 # Our pubkey. Passed as an explicit --mention below, it makes the literal
 # "@$AGENT_NAME" in the outcome text presentation-only - the relay rejects any
