@@ -27,19 +27,21 @@ export BUZZ="$T/bin/buzz" SENT="$T/sent.log"; : > "$SENT"
 fail() { echo "FAIL: $1"; FAILS=$((FAILS+1)); }
 FAILS=0
 
-# --- 1. per-repo serialization (sim/xcodebuild jobs only) -----------------
+# --- 1. per-repo, per-tool serialization ---------------------------------
 cd "$T/repo"
 t0=$(date +%s)
-"$DIR/agent-job.sh" --label "uitest run 1" -- bash -c 'xcodebuild build; sleep 4' >/dev/null 2>&1
-"$DIR/agent-job.sh" --label "uitest run 2" -- bash -c 'xcodebuild build; echo ran > '"$T"'/second-ran' >/dev/null 2>&1
-# a non-sim job must NOT queue behind the sim job
-"$DIR/agent-job.sh" --label deploy -- bash -c 'echo now > '"$T"'/unrelated-ran' >/dev/null 2>&1
+"$DIR/agent-job.sh" --label "ios build" -- bash -c 'xcodebuild build; sleep 4' >/dev/null 2>&1
+"$DIR/agent-job.sh" --label "ios verify" -- bash -c 'xcodebuild verify; echo ran > '"$T"'/second-ran' >/dev/null 2>&1
+# a different tool must NOT queue behind the xcodebuild lock
+"$DIR/agent-job.sh" --label "rust build" -- bash -c 'cargo build; echo now > '"$T"'/other-tool-ran' >/dev/null 2>&1
+"$DIR/agent-job.sh" --label deploy -- bash -c 'deploy --all; echo now > '"$T"'/unrelated-ran' >/dev/null 2>&1
 sleep 1
-[ -f "$T/unrelated-ran" ] || fail "non-sim job wrongly queued behind the sim lock"
-# while sim job 1 runs, exactly one repo lock exists and sim job 2 has not started
-locks="$(ls "$JOBS"/repo-*.lock 2>/dev/null | wc -l | tr -d ' ')"
-[ "$locks" = "1" ] || fail "expected exactly 1 repo lock while sim job 1 runs, saw $locks"
-[ -f "$T/second-ran" ] && fail "sim job 2 started while sim job 1 held the lock"
+[ -f "$T/other-tool-ran" ] || fail "different-tool job wrongly queued behind the xcodebuild lock"
+[ -f "$T/unrelated-ran" ] || fail "non-build job wrongly queued behind the xcodebuild lock"
+# while the xcodebuild job runs, exactly one lock exists and the queued one has not started
+locks="$(ls "$JOBS"/repo-*-tool-xcodebuild.lock 2>/dev/null | wc -l | tr -d ' ')"
+[ "$locks" = "1" ] || fail "expected exactly 1 xcodebuild lock while job 1 runs, saw $locks"
+[ -f "$T/second-ran" ] && fail "same-tool job 2 started while job 1 held the lock"
 # job 2 must run after job 1 finishes (~4s), not before
 for _ in $(seq 1 30); do [ -f "$T/second-ran" ] && break; sleep 1; done
 [ -f "$T/second-ran" ] || fail "job 2 never ran"
@@ -47,16 +49,14 @@ elapsed=$(( $(date +%s) - t0 ))
 [ "$elapsed" -ge 3 ] || fail "job 2 did not queue behind job 1 (elapsed ${elapsed}s)"
 # the lock is released when the holder exits
 sleep 1
-[ -z "$(ls "$JOBS"/repo-*.lock 2>/dev/null)" ] || fail "repo lock not released after holder exit"
+[ -z "$(ls "$JOBS"/repo-*tool-*.lock 2>/dev/null)" ] || fail "tool lock not released after holder exit"
 
 # a stale lock (holder died) is stolen, not waited on
-lockdir="$(ls -d "$JOBS"/repo-*.lock 2>/dev/null)"
-rm -rf "$JOBS"/repo-*.lock; mkdir -p "$JOBS/repo-stale.lock"; echo "pid=999999" > "$JOBS/repo-stale.lock/pid"
 top="$(git -C "$T/repo" rev-parse --show-toplevel)"
-real_lock="$JOBS/repo-$(printf %s "$top" | md5 -q).lock"
-rm -rf "$real_lock"; mkdir -p "$real_lock"; echo "pid=999999" > "$real_lock/pid"
+real_lock="$JOBS/repo-$(printf %s "$top" | md5 -q)-tool-xcodebuild.lock"
+rm -rf "$JOBS"/repo-*tool-*.lock; mkdir -p "$real_lock"; echo "pid=999999" > "$real_lock/pid"
 t0=$(date +%s)
-"$DIR/agent-job.sh" --label "xcodebuild build" -- bash -c 'true' >/dev/null 2>&1
+"$DIR/agent-job.sh" --label "steal" -- bash -c 'xcodebuild build' >/dev/null 2>&1
 for _ in $(seq 1 15); do [ -f "${JOBS%/jobs}" ] ; start=$(date +%s); [ $((start - t0)) -gt 0 ] && break; sleep 1; done
 elapsed=$(( $(date +%s) - t0 ))
 [ "$elapsed" -le 3 ] || fail "stale lock not stolen (waited ${elapsed}s)"
