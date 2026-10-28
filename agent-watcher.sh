@@ -1334,6 +1334,67 @@ wait_with_timeout() {  # $1=pid
   kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
 }
 
+# Mirror intermediate assistant progress into the active thread while the harness
+# streams its --mode json event stream into out_file. Runs in the background; the
+# worker kills it when the turn ends. Guarantees:
+#   - only COMPLETED assistant text messages are candidates (message_end events);
+#     thinking blocks and tool calls/results are never mirrored
+#   - one-behind lag: an update is posted only once a LATER assistant message has
+#     arrived, so the final reply is never mirrored here - the closing path posts
+#     the final response exactly once
+#   - identical consecutive updates post once (dedupe), and posts are throttled to
+#     one per PROGRESS_MIRROR_MIN_SECS (repeats in between are dropped, not queued)
+#   - explicit agent posts via `buzz messages send` are tool calls, not assistant
+#     text, so they are never mirrored on top of
+mirror_progress() {  # $1=out_file $2=channel_id $3=reply_to_root
+  local out_file="$1" cid="$2" root="$3"
+  local deadline=$(( $(date +%s) + ${MODEL_TIMEOUT:-600} + 300 ))
+  local n_posted=0 last_hash="" last_post=0 total i text hash now
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep "${PROGRESS_MIRROR_POLL:-5}"
+    [ -f "$out_file" ] || continue
+    # Completed assistant texts, base64 per line to survive any bytes.
+    local texts=()
+    while IFS= read -r line; do texts+=("$line"); done < <(python3 - "$out_file" <<'PYEV'
+import json, sys, base64
+for line in open(sys.argv[1], errors='replace'):
+    line = line.strip()
+    if not line.startswith('{'):
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    if ev.get('type') != 'message_end':
+        continue
+    msg = ev.get('message') or {}
+    if msg.get('role') != 'assistant':
+        continue
+    text = ''.join(c.get('text', '') for c in msg.get('content', [])
+                   if isinstance(c, dict) and c.get('type') == 'text').strip()
+    if text:
+        print(base64.b64encode(text.encode()).decode())
+PYEV
+)
+    total=${#texts[@]}
+    # One-behind lag: the most recent assistant message is the final reply (or its
+    # direct predecessor) - the closing path posts it, so never mirror index total-1.
+    for ((i = n_posted; i < total - 1; i++)); do
+      text="$(printf '%s' "${texts[$i]}" | base64 -d 2>/dev/null)"
+      printf '%s' "$text" | grep -qE '\[\[(WATCHER:|SKIP)' && continue
+      hash="$(printf '%s' "$text" | cksum | cut -d' ' -f1)"
+      n_posted=$((i + 1))
+      [ "$hash" = "$last_hash" ] && continue               # dedupe repeated updates
+      now="$(date +%s)"
+      [ "$((now - last_post))" -lt "${PROGRESS_MIRROR_MIN_SECS:-45}" ] && continue  # throttle: drop
+      last_hash="$hash"; last_post="$now"
+      text="$(printf '%s' "$text" | head -c 400)"
+      "$BUZZ" messages send --channel "$cid" --reply-to "$root" --content "$text" >/dev/null 2>&1 \
+        || echo "[$AGENT_NAME worker-$$] progress mirror post failed for $root"
+    done
+  done
+}
+
 worker() {
   local msg_id="$1" channel_id="$2" content="$3" root_id="$4" threaded="$5" directly="$6" msgs="$7"
 
@@ -1629,9 +1690,23 @@ print(max(ts))" 2>/dev/null || echo 0)"
 
   out_file="$(mktemp)"
 
+  # Progress mirroring: tail the harness event stream and post intermediate
+  # assistant updates into the thread while the turn runs (PROGRESS_MIRROR=0 to
+  # disable). Killed when the turn ends so the final reply posts exactly once
+  # via the normal closing path below.
+  mirror_pid=""
+  if [ "${PROGRESS_MIRROR:-1}" = "1" ]; then
+    mirror_root="$root_id"; [ -z "$mirror_root" ] && mirror_root="$msg_id"
+    mirror_progress "$out_file" "$channel_id" "$mirror_root" &
+    mirror_pid=$!
+  fi
+
   # Run agent with timeout using harness adapter
   invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
   wait_with_timeout $!
+  if [ -n "$mirror_pid" ]; then
+    kill "$mirror_pid" 2>/dev/null; wait "$mirror_pid" 2>/dev/null || true
+  fi
 
   # Extract result and session using harness-aware extraction
   reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
