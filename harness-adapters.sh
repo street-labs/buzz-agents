@@ -229,6 +229,9 @@ invoke_codex() {
   local flags="--json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox"
   flags="$flags --model \"\$model\" -o \"\$last_file\""
   flags="$flags -c developer_instructions=\"\$system_prompt\""
+  # AGENT_EFFORT (env file): low|medium|high|xhigh|max. Unset = the model's default, which
+  # models_cache.json lists per model (medium for the gpt-6 and gpt-5.6 families).
+  [ -n "${AGENT_EFFORT:-}" ] && flags="$flags -c model_reasoning_effort=\"\$AGENT_EFFORT\""
 
   if [ -n "$sid" ]; then
     ( cd "$work_dir" && eval "codex exec resume $flags \"\$sid\" \"\$prompt\"" >"$out_file" 2>/dev/null </dev/null )
@@ -624,10 +627,11 @@ map_model_name() {
       # do not invent names here. A ChatGPT-account login rejects anything not in it with a
       # 400 ("model is not supported when using Codex with a ChatGPT account"), and the
       # rejection only shows up on the first real turn.
-      # Listed as of 0.149.1: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4,
-      # gpt-5.4-mini, gpt-5.3-codex-spark.
+      # Listed as of 0.155.1: gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra,
+      # gpt-5.6-luna.
       case "$model" in
         codex) echo "gpt-5.6-terra" ;;      # verified end to end incl. session resume
+        codex-sol) echo "gpt-6-sol" ;;
         codex-mini) echo "gpt-5.4-mini" ;;
         codex-long) echo "gpt-5.4" ;;       # 1M context, for whole-diff review
         *) echo "$model" ;;
