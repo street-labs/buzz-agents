@@ -32,6 +32,8 @@ invoke_claude() {
   # default stays whatever the CLI does today -- turning it on is a config decision, not
   # something to change under a running agent.
   [ -n "${AGENT_AUTOCOMPACT:-}" ] && base_cmd="$base_cmd --autocompact \"\$AGENT_AUTOCOMPACT\""
+  # AGENT_EFFORT (env file): low|medium|high|xhigh|max. Unset = Claude Code's default.
+  [ -n "${AGENT_EFFORT:-}" ] && base_cmd="$base_cmd --effort \"\$AGENT_EFFORT\""
 
   if [ -n "$sid" ]; then
     ( cd "$work_dir" && eval "$base_cmd --resume \"\$sid\"" >"$out_file" 2>/dev/null </dev/null )
@@ -268,6 +270,8 @@ invoke_cursor() {
   # --dangerously-bypass-approvals-and-sandbox. Without it the turn blocks on approval and
   # times out headlessly.
   local flags="--print --output-format json --force --model \"\$model\""
+  # No effort flag: Cursor encodes it in the model slug (claude-opus-5-thinking-high), so
+  # AGENT_EFFORT does not apply here.
 
   if [ -n "$sid" ]; then
     ( cd "$work_dir" && eval "cursor-agent $flags --resume \"\$sid\" \"\$combined\"" >"$out_file" 2>/dev/null </dev/null )
