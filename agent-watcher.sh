@@ -1609,13 +1609,14 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
       sleep 10; _slept=$((_slept + 10))
     done
     if [ -n "$_slot_lock" ]; then
-      printf 'root=%s\npid=%s\n' "$root_id" "$$" > "$_slot_lock/owner"
+      # $$ is the watcher's pid in a backgrounded function and bash 3.2 has no $BASHPID;
+      # sh's $PPID is this worker subshell, so a dead holder gets stolen at once.
+      sh -c 'printf "root=%s\npid=%s\n" "$1" "$PPID"' _ "$root_id" > "$_slot_lock/owner"
       # Keep the lock out of git status: untracked dirt there trips the slot-stale
       # checks and parks phantom "uncommitted work".
       _gd="$(git -C "$work_dir" rev-parse --absolute-git-dir 2>/dev/null)" \
         && { mkdir -p "$_gd/info"; grep -qxF '.buzz-session' "$_gd/info/exclude" 2>/dev/null \
                || echo '.buzz-session' >> "$_gd/info/exclude"; }
-      trap 'rm -rf "'"$_slot_lock"'"' EXIT   # worker runs in its own subshell; fires on exit
       echo "[$AGENT_NAME worker-$$] session lock taken on $work_dir (root $root_id)"
     fi
   fi
@@ -2023,6 +2024,14 @@ print(body.replace(token, "@\u200b" + token[1:]), end="")
   rm -f "$WORKERS/root-$root_id.pid"
 }
 
+# Background entry point for worker: releases the slot session lock on every return
+# path. An EXIT trap would be cleaner, but macOS /bin/bash 3.2 never fires one set
+# inside a backgrounded function. _slot_lock is a subshell global set by worker.
+spawn_worker() {
+  worker "$@"
+  [ -n "${_slot_lock:-}" ] && rm -rf "$_slot_lock"
+}
+
 # Reap finished workers and enforce max concurrency.
 # Counts root-*.pid only: each live worker writes TWO pid files (<msg_id>.pid and
 # root-<root_id>.pid), so globbing *.pid double-counted and halved MAX_WORKERS.
@@ -2196,7 +2205,7 @@ salon_arbiter_pass() {  # $1=salon channel id  $2=messages json
 
     if [ "$tap_name" = "$AGENT_NAME" ]; then
       # The arbiter itself was selected: answer directly.
-      worker "$id" "$cid" "$content" "$root_id" 1 1 "$msgs" "$tap_depth" &
+      spawn_worker "$id" "$cid" "$content" "$root_id" 1 1 "$msgs" "$tap_depth" &
       echo $! > "$rootpid"
       spawned_roots="$spawned_roots$root_id "
     else
@@ -2354,7 +2363,7 @@ try: print(json.load(sys.stdin).get("content",""))
 except Exception: pass' 2>/dev/null)"
             [ -z "$salon_content" ] && salon_content="$content"
             ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
-            worker "$salon_trigger" "$salon_cid" "$salon_content" "$salon_root" 1 1 "$salon_msgs" "$salon_depth" &
+            spawn_worker "$salon_trigger" "$salon_cid" "$salon_content" "$salon_root" 1 1 "$salon_msgs" "$salon_depth" &
             echo $! > "$WORKERS/root-$salon_root.pid"
             continue
           else
@@ -2379,7 +2388,7 @@ except Exception: pass' 2>/dev/null)"
       fi
 
       # Spawn worker in background; record its pid as the per-thread lock
-      worker "$id" "$cid" "$content" "$root_id" "$threaded" "$directly" "$MSGS" &
+      spawn_worker "$id" "$cid" "$content" "$root_id" "$threaded" "$directly" "$MSGS" &
       echo $! > "$rootpid"
       spawned_roots="$spawned_roots$root_id "
 
