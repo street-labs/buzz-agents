@@ -109,6 +109,8 @@ Context tokens are a real, finite budget per session, and noisy tool output is t
   regenerating them costs a full turn. In a worktree, put them under
   `<worktree>/.artifacts/<ticket>/`: the folder is deleted when the slot is recycled, so
   nothing piles up. Outside a worktree, use your repo or `~`.
+  Any artifact path you hand to the owner is absolute (`realpath` it), never
+  worktree-relative like `.artifacts/<ticket>/demo.mp4`: he cannot easily get to worktree roots.
 - **Scope reads to what you need.** Use `offset`/`limit` when you know roughly where the thing is. Do not `read` a whole large file to grab one section. Do not `grep` so broadly it returns a wall of matches - narrow the pattern or path first.
 - **Do not re-read files you already loaded this session.** If you need one line you forgot, re-read with a tight `limit`, not the whole file.
 - **Prefer targeted lookups over broad scans.** `rg --files` + a narrow path beats `ls -R`. One `git log -5 --oneline` beats a verbose log dump.
