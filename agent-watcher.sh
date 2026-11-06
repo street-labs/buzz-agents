@@ -355,6 +355,7 @@ for m in msgs:
         continue
     ptags =[t[1] for t in m.get("tags", []) if len(t) >= 2 and t[0] == "p"]
     peer_ptags = [p for p in ptags if p in peers]
+    peer_ptags_other = [p for p in peer_ptags if p != me]
     # Multi-summon (2+ agents p-tagged) is allowed: each watcher independently
     # sees its own p-tag below (`explicitly`) and answers once. A former blanket
     # skip here meant tagging two bots summoned NEITHER.
@@ -364,7 +365,8 @@ for m in msgs:
     # also honors a bare name mention and the generic @builder/@agent (looser, for
     # normal channels where the agent follows along).
     explicitly = (me and me in ptags) or (("@" + name) in cl)
-    directly = explicitly or (name in cl) or ("@builder" in cl) or ("@agent" in cl)
+    # A p-tag to a peer settles who the message is for: the looser matches yield to it.
+    directly = explicitly or (not peer_ptags_other and ((name in cl) or ("@builder" in cl) or ("@agent" in cl)))
     # Allow owner messages always, OR peer messages that explicitly summon us (bot-to-bot
     # coordination). AGENT_THREAD_FOLLOW_PEERS=1 additionally lets peer messages keep a
     # thread we track going without a fresh summon (human members replying in a thread).
@@ -383,7 +385,7 @@ for m in msgs:
             continue
         if in_thread and not directly:
             # Defer if this message explicitly p-tags a different agent.
-            if any(p != me for p in peer_ptags):
+            if peer_ptags_other:
                 continue
             # Otherwise only the "active" agent answers an untagged follow-up: the peer
             # the owner most recently addressed in this thread. Someone else -> stand
@@ -1828,7 +1830,11 @@ PY
   # ran but produced no visible reply is almost always a silent model turn (deepseek
   # thinking-only turns, 2026-08-06). Nudge the same session once before falling back
   # to the "(no reply produced)" placeholder.
-  if { [ -z "$reply" ] || [ "$reply" = "null" ]; } && [ "${REPLY_GUARD:-1}" = "1" ] && [ "$watcher_action" != "mute" ]; then
+  # Only when this message addressed us: on a follow-along turn, silence is the right
+  # answer to a message meant for someone else, and nudging it forces a "that's for
+  # builder" post into the thread.
+  [ "$reply" = "null" ] && reply=""
+  if [ -z "$reply" ] && [ "${REPLY_GUARD:-1}" = "1" ] && [ "$watcher_action" != "mute" ] && [ "$directly" = "1" ]; then
     echo "[$AGENT_NAME worker-$$] empty reply on $msg_id - re-prompting once (reply guard)"
     local retry_out retry_sid eff_sid
     eff_sid="${new_sid:-$sid}"; [ "$on_fallback" = 1 ] && eff_sid=""
@@ -1842,9 +1848,17 @@ PY
     [ -n "$retry_sid" ] && [ "$on_fallback" = 0 ] && { new_sid="$retry_sid"; set_session "$root_id" "$new_sid"; }
   fi
 
-  [ -z "$reply" ] && [ "$watcher_action" != "mute" ] && reply="(no reply produced - check $STATE logs)"
+  [ -n "$reply" ] || [ "$watcher_action" = "mute" ] || [ "$directly" != "1" ] || reply="(no reply produced - check $STATE logs)"
 
   reply_target="$root_id"; [ -z "$reply_target" ] && reply_target="$msg_id"
+
+  # Silent follow-along turn: post nothing, keep following the thread.
+  if [ -z "$reply" ] && [ "$watcher_action" != "mute" ]; then
+    echo "[$AGENT_NAME worker-$$] stayed silent on $msg_id (not addressed)"
+    "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
+    rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
+    return 0
+  fi
 
   # Salon send gate (FR-salon-send-gate): slow turns or turns where new thread
   # messages arrived while composing get one Jev check. Fail-open: any problem
