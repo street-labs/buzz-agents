@@ -135,7 +135,8 @@ contributed to this conversation. You see their full context so you can coordina
 - If a peer bot already gave a complete answer and you have nothing to add, say so
   briefly ("peer-bot covered it") or produce NO OUTPUT - the harness detects empty
   output and skips posting, preventing useless back-and-forth.
-- If the owner's message is addressed to another bot and you were not mentioned, do not reply.
+- If the owner's message is addressed to another bot and you were not mentioned, produce
+  NO OUTPUT. Do not post that it is theirs; the turn should leave nothing in the thread.
 - If you and a peer are both working the same problem, acknowledge their work and
   coordinate rather than duplicating it.
 
