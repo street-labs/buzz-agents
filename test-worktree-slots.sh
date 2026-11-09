@@ -27,7 +27,7 @@ set_worktree() {
 }
 # functions under test, extracted verbatim
 eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^reserve_slot() {/,/^}/p;/^claim_new_slot() {/,/^}/p;/^del_worktree() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
-eval "$(sed -n '/^create_worktree() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^repo_git_locked() {/,/^}/p;/^add_worktree() {/,/^}/p;/^create_worktree() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
 
@@ -115,5 +115,26 @@ a="$(get_worktree $rA)"; b="$(get_worktree $rB)"
 [ -d "$a" ] && [ -d "$b" ] || fail "concurrent claims handed back non-directories ($a / $b)"
 [ "$a" != "$b" ] || fail "concurrent claims got the same slot: $a"
 echo "ok: concurrent claims got distinct slots ($a / $b)"
+
+# Five threads starting at once (the burst that hit builder) must all get a slot.
+pids=""; for i in 1 2 3 4 5; do create_worktree "burst${i}xxxxx" >/dev/null 2>&1 & pids="$pids $!"; done
+wait $pids
+for i in 1 2 3 4 5; do
+  w="$(get_worktree "burst${i}xxxxx")"
+  [ -n "$w" ] && [ -d "$w" ] && [ "$w" != "$AGENT_REPO" ] || fail "burst thread $i got no worktree ($w)"
+done
+echo "ok: five simultaneous thread starts all got worktrees"
+
+# Fail closed: when git cannot add a worktree, print nothing (never $AGENT_REPO),
+# return non-zero, and log git's own error.
+git -C "$AGENT_REPO" remote set-url origin /nonexistent/origin
+out="$(create_worktree failfail99999999 2>$T/err)"; rc=$?
+git -C "$AGENT_REPO" remote set-url origin $T/origin
+[ $rc -ne 0 ] || fail "failed add returned 0"
+[ -z "$out" ] || fail "failed add printed a path: $out"
+grep -q "worktree creation failed for failfail99999999: .*nonexistent" $T/err || fail "git stderr not logged: $(cat $T/err)"
+grep -q "retrying" $T/err || fail "no retry before giving up"
+[ -z "$(get_worktree failfail99999999)" ] || fail "failed add left a reservation row"
+echo "ok: failed add fails closed, retries once, logs git's error"
 
 echo "ALL PASS"
