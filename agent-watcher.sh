@@ -996,6 +996,26 @@ drop_stale_build() {  # $1 = slot path, before its reset; $2 = the sha it moves 
   rm -rf "$dir" && echo "[$AGENT_NAME] dropped $dir: built against main $(( (to_t - from_t) / 86400 ))d behind" >&2
 }
 
+# fetch / worktree add serialised per repo: parallel thread starts racing on
+# .git locks (index.lock, ref locks, packed-refs) is the suspected cause of the
+# "worktree creation failed" bursts. git's stderr flows to the caller.
+repo_git_locked() {  # git args... (run in $AGENT_REPO under the repo lock)
+  local lock; lock="$(git -C "$AGENT_REPO" rev-parse --absolute-git-dir 2>/dev/null)/buzz-watcher.lock"
+  ( cd "$AGENT_REPO" && flock 200 && git "$@" ) 200>"$lock"
+}
+
+add_worktree() {  # path branch; one locked fetch + add. -b fails if the branch
+  # already exists (a thread whose worktree was deleted out from under it), so
+  # attach the existing branch instead.
+  repo_git_locked fetch origin >/dev/null || return 1
+  repo_git_locked worktree prune  # a missing-but-registered path blocks add
+  repo_git_locked worktree add "$1" -b "$2" origin/main >/dev/null 2>&1 ||
+    repo_git_locked worktree add "$1" "$2" >/dev/null
+}
+
+# Prints the worktree path on success. On failure prints NOTHING and returns 1:
+# a branch-pr agent must never fall back to $AGENT_REPO, which is the owner's own
+# checkout (on main, with their uncommitted changes).
 create_worktree() {
   local root="$1" repo_name base_dir wt_path branch short_id existing old_branch n prior=""
   repo_name="$(basename "$AGENT_REPO")"
@@ -1014,7 +1034,7 @@ create_worktree() {
     # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
     # output, which is the entire point of recycling the slot. .artifacts/ is the
     # one ignored dir that belongs to the old thread, not the build, so it goes too.
-    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 ) || true
+    repo_git_locked fetch origin >/dev/null 2>&1 || true
     # A thread that lost its slot gets put back on its own branch, not origin/main.
     if prior="$(resurrect_branch "$root")"; then
       branch="$prior"
@@ -1045,15 +1065,14 @@ create_worktree() {
   # out of slots must never stop a new thread from starting work.
   if [ -z "$wt_path" ]; then
     wt_path="$(claim_new_slot "$base_dir" "$root")"
-    # -b fails if the branch already exists, which is what a thread whose worktree
-    # was deleted out from under it hits: the branch outlives the directory. Attach
-    # the existing branch rather than falling through to the main repo.
-    ( cd "$AGENT_REPO" && git fetch origin >/dev/null 2>&1 && \
-      { git worktree add "$wt_path" -b "$branch" origin/main >/dev/null 2>&1 || \
-        git worktree add "$wt_path" "$branch" >/dev/null 2>&1; } ) || {
+    local git_err; git_err="$(add_worktree "$wt_path" "$branch" 2>&1 >/dev/null)" || {
+      # Retry once. The path was ours and empty, so clear any half-made add.
+      echo "[$AGENT_NAME] worktree add failed for $root, retrying: $git_err" >&2
+      rm -rf "$wt_path"; sleep 2
+      git_err="$(add_worktree "$wt_path" "$branch" 2>&1 >/dev/null)"
+    } || {
       del_worktree "$root"  # release the reservation the add did not consume
-      echo "[$AGENT_NAME] worktree creation failed for $root" >&2
-      echo "$AGENT_REPO"
+      echo "[$AGENT_NAME] worktree creation failed for $root: $git_err" >&2
       return 1
     }
     echo "[$AGENT_NAME] created worktree: $wt_path (branch $branch)" >&2  # log to stderr; stdout is the captured path
@@ -1397,6 +1416,14 @@ PYEV
   done
 }
 
+# create_worktree failed: say so in the thread and skip the turn. No fallback.
+worktree_failed() {  # channel root msg
+  echo "[$AGENT_NAME worker-$$] no worktree for $2, skipping turn (no fallback to $AGENT_REPO)" >&2
+  "$BUZZ" messages send --channel "$1" --reply-to "${2:-$3}" --content "Watcher: could not create a worktree for this thread, so $AGENT_NAME did not run. It will not fall back to the main checkout. The git error is in the $AGENT_NAME log. Tag $AGENT_NAME again to retry." >/dev/null 2>&1 \
+    || echo "[$AGENT_NAME worker-$$] worktree-failure post failed for $3" >&2
+  rm -f "$WORKERS/$3.pid" "$WORKERS/root-$2.pid"
+}
+
 worker() {
   local msg_id="$1" channel_id="$2" content="$3" root_id="$4" threaded="$5" directly="$6" msgs="$7"
 
@@ -1573,13 +1600,13 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
     # conversation, and create_worktree puts the thread back on its own branch.
     if [ ! -d "$work_dir" ]; then
       echo "[$AGENT_NAME worker-$$] worktree gone: $work_dir - cutting a replacement" >&2
-      if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")"; fi
+      if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")" || { worktree_failed "$channel_id" "$root_id" "$msg_id"; return 0; }; fi
     fi
   else
     # New thread: direct-main agents work in the main repo; branch-pr
     # agents get an isolated per-thread worktree cut from fresh main.
     if [ -z "$work_dir" ]; then
-      if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")"; fi
+      if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")" || { worktree_failed "$channel_id" "$root_id" "$msg_id"; return 0; }; fi
     fi
   fi
 
