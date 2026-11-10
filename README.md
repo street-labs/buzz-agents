@@ -180,6 +180,22 @@ agent's context; the message carries the path.
 `test-agent-jobs.sh` covers both outcomes, the no-double-report rule, and that a
 running job is left alone.
 
+## Usage limits
+
+Claude Code does not error when a usage limit is reached. It returns the notice as the
+turn's result, so without a check it is posted to the channel as the agent's answer.
+
+Set `AGENT_FALLBACK_HARNESS` and `AGENT_FALLBACK_MODEL` and the watcher instead records
+the reset time, re-runs the turn on the fallback, and bridges the conversation across by
+hand, since the fallback cannot resume the primary's session. Later turns start on the
+fallback directly until the clock passes the reset time, so switching back needs no timer.
+
+All of that hangs on recognising the notice, and the wording is not stable — it has been
+`session limit`, `5-hour limit` and `weekly limit`. A wording that goes unrecognised takes
+the whole mechanism out silently: no fallback, no marker, nothing in the log, and the
+owner gets a quota notice where an answer should be. `test-session-limit.sh` asserts every
+known wording, so the next one fails a test instead of a conversation.
+
 ## Multi-agent
 
 Run several agents in one workspace and they coordinate: the watcher names the other
