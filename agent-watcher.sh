@@ -654,10 +654,15 @@ reset_thread_session() {  # $1=root
 # exactly that twice on 2026-08-31:
 #
 #   You've hit your session limit · resets 3:10pm (America/Indianapolis)
+#   You've hit your 5-hour limit · resets 11:50am (America/Indianapolis)
+#
+# The wording of the notice changes without warning, and the failure is silent: an
+# unmatched notice is treated as a normal reply, so it gets posted to the channel as the
+# turn's answer and no LIMITED marker is written, which means the fallback harness never
+# runs on the next turn either. test-session-limit.sh pins every wording seen so far.
 #
 # The notice carries a reset time, so the switch back needs no polling and no timer - just
 # compare the clock on the next turn.
-LIMIT_RE="hit your session limit"
 
 # Print the epoch the limit resets at, or nothing if the reply is not a limit notice.
 session_limit_until() {  # $1=reply text
@@ -666,7 +671,7 @@ import sys, re, datetime
 try: from zoneinfo import ZoneInfo
 except ImportError: sys.exit(0)
 t = sys.stdin.read()
-if "hit your session limit" not in t: sys.exit(0)
+if not re.search(r"hit your (?:session|\d+-hour|weekly) limit", t, re.I): sys.exit(0)
 m = re.search(r"resets\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(([^)]+)\)", t, re.I)
 if not m: sys.exit(0)
 h, mi, ampm, tz = int(m.group(1)), int(m.group(2)), m.group(3).lower(), m.group(4)
