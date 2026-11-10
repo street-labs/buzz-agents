@@ -653,11 +653,11 @@ reset_thread_session() {  # $1=root
 # RESULT, so it sails through as a normal reply and gets posted to the channel. Builder did
 # exactly that twice on 2026-08-31:
 #
-#   You've hit your session limit · resets 3:10pm (America/Indianapolis)
+#   You've hit your session limit · resets 3:10pm (Europe/London)
+#   You've hit your 5-hour limit · resets 11:50am (Europe/London)
 #
 # The notice carries a reset time, so the switch back needs no polling and no timer - just
 # compare the clock on the next turn.
-LIMIT_RE="hit your session limit"
 
 # Print the epoch the limit resets at, or nothing if the reply is not a limit notice.
 session_limit_until() {  # $1=reply text
@@ -666,7 +666,11 @@ import sys, re, datetime
 try: from zoneinfo import ZoneInfo
 except ImportError: sys.exit(0)
 t = sys.stdin.read()
-if "hit your session limit" not in t: sys.exit(0)
+# Claude Code has shipped several wordings for the same notice: "session limit",
+# "5-hour limit", "weekly limit". Matching one literal silently stopped the fallback
+# when the wording changed (2026-10-09 to 2026-11-10), and the notice got posted as
+# the answer instead.
+if not re.search(r"hit your (?:session|\d+-hour|weekly) limit", t, re.I): sys.exit(0)
 m = re.search(r"resets\s+(\d{1,2}):(\d{2})\s*([ap]m)\s*\(([^)]+)\)", t, re.I)
 if not m: sys.exit(0)
 h, mi, ampm, tz = int(m.group(1)), int(m.group(2)), m.group(3).lower(), m.group(4)
