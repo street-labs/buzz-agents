@@ -140,6 +140,12 @@ contributed to this conversation. You see their full context so you can coordina
 - If you and a peer are both working the same problem, acknowledge their work and
   coordinate rather than duplicating it.
 
+**Answer back to the agent that asked.** When your reply delivers what another agent
+asked you for (the answer, or a question back to it), write `@<that-agent>` once in the
+reply. That p-tags it and wakes it; without the tag it never sees your answer. Never tag
+an agent just to acknowledge, thank, or say "got it". The watcher also stops a peer
+summon after 3 agent turns in a row until a human posts, so do not chain questions.
+
 **Loop prevention:** When you've contributed what you can and further replies would just
 be noise, bow out. The owner (the owner) will re-summon you if needed.
 

@@ -318,6 +318,13 @@ try:
 except:
     assist = set()
 follow_peer_threads = (len(sys.argv) > 9 and sys.argv[9] == "1")
+# Loop cap input: roster = agent pubkeys only (peers can include humans).
+agents = set()
+try:
+    if len(sys.argv) > 10 and sys.argv[10]:
+        agents = {l.split("\t")[0] for l in open(sys.argv[10]) if l.strip()}
+except:
+    agents = set()
 try:
     msgs = json.load(sys.stdin)
 except:
@@ -403,7 +410,21 @@ for m in msgs:
                     active_t = x.get("created_at", 0); active = xp[0]
             if active is not None and active != me:
                 continue
-    print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + str(int(threaded)) + "\t" + str(int(bool(directly))))
+    # Consecutive agent turns in this thread since the last human message, this one
+    # included. A run of posts by one agent (progress updates, then the reply) is one
+    # turn. Owner messages and our own job posts are never capped.
+    turns = 0
+    if pub != owner and not job_post and agents:
+        thread = sorted((x for x in msgs if find_root(x)[0] == root_id), key=lambda x: x.get("created_at", 0))
+        ids = [x.get("id") for x in thread]
+        last = None
+        for x in reversed(thread[:ids.index(mid) + 1] if mid in ids else thread):
+            xp = x.get("pubkey", "")
+            if xp not in agents and xp != me:
+                break
+            if xp != last:
+                turns += 1; last = xp
+    print(mid + "\t" + base64.b64encode(c.encode()).decode() + "\t" + root_id + "\t" + str(int(threaded)) + "\t" + str(int(bool(directly))) + "\t" + str(turns))
 '
 
 # Every message in the thread as fetched for this turn: they are all in this turn's
@@ -2366,8 +2387,16 @@ while true; do
       continue
     fi
 
-    while IFS=$'\t' read -r id b64 root_id threaded directly; do
+    while IFS=$'\t' read -r id b64 root_id threaded directly agent_turns; do
       [ -z "$id" ] && continue
+
+      # Loop cap: a peer summon after AGENT_TURN_CAP consecutive agent turns waits for
+      # a human. Same cap as the salon path; marked seen so it is not re-logged.
+      if [ "${agent_turns:-0}" -gt "${AGENT_TURN_CAP:-$SALON_AGENT_TURN_CAP}" ]; then
+        echo "[$AGENT_NAME] turn cap ($agent_turns agent turns) - skipped $id, waiting for a human in $root_id"
+        ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
+        continue
+      fi
 
       # Skip if already being worked on
       [ -f "$WORKERS/$id.pid" ] && continue
@@ -2437,7 +2466,7 @@ except Exception: pass' 2>/dev/null)"
       echo $! > "$rootpid"
       spawned_roots="$spawned_roots$root_id "
 
-    done < <(printf '%s' "$MSGS" | python3 -c "$FILTER" "$SEEN" "$OWNER" "$AGENT_NAME" "$THREADS" "$AGENT_PEERS_FILE" "$BOT_PUB" "$mo" "$AGENT_ASSIST_FILE" "${AGENT_THREAD_FOLLOW_PEERS:-}")
+    done < <(printf '%s' "$MSGS" | python3 -c "$FILTER" "$SEEN" "$OWNER" "$AGENT_NAME" "$THREADS" "$AGENT_PEERS_FILE" "$BOT_PUB" "$mo" "$AGENT_ASSIST_FILE" "${AGENT_THREAD_FOLLOW_PEERS:-}" "${AGENT_ROSTER_FILE:-}")
   done
 
   sleep 5
