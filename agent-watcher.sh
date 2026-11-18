@@ -1005,6 +1005,21 @@ claim_free_slot() {
 # Only the products go: package checkouts and caches beside them stay warm.
 SLOT_BUILD_STALE_DAYS="${SLOT_BUILD_STALE_DAYS:-3}"
 
+# A slot's .artifacts/ belongs to the thread that just left it, but a demo there may
+# not be attached or shared yet. Move it to ~/.buzz/artifacts/<label>/ instead of
+# deleting it, and prune anything there older than 7 days. Fails (and keeps the
+# original) if the copy fails, so a recycle never loses the only copy.
+stash_artifacts() {  # $1 = worktree, $2 = label (branch or slot name)
+  local src="$1/.artifacts" root="$HOME/.buzz/artifacts" dest
+  dest="$root/$(printf '%s' "$2" | tr '/ ' '--')"
+  if [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+    mkdir -p "$dest" && cp -Rp "$src/." "$dest/" && touch "$dest" || return 1
+  fi
+  rm -rf "$src"
+  find "$root" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
 drop_stale_build() {  # $1 = slot path, before its reset; $2 = the sha it moves to
   local slot="$1" to="$2" dir gitdir from from_t to_t
   [ -n "${SLOT_BUILD_DIR:-}" ] || return 0
@@ -1058,7 +1073,7 @@ create_worktree() {
     old_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null || echo "")"
     # -fd without -x: drops stray tracked-adjacent files but keeps ignored build
     # output, which is the entire point of recycling the slot. .artifacts/ is the
-    # one ignored dir that belongs to the old thread, not the build, so it goes too.
+    # one ignored dir that belongs to the old thread, not the build, so it is stashed.
     repo_git_locked fetch origin >/dev/null 2>&1 || true
     # A thread that lost its slot gets put back on its own branch, not origin/main.
     if prior="$(resurrect_branch "$root")"; then
@@ -1068,7 +1083,7 @@ create_worktree() {
     drop_stale_build "$wt_path" "$(git -C "$AGENT_REPO" rev-parse origin/main 2>/dev/null)"
     if ! ( git -C "$wt_path" checkout -B "$branch" "${prior:-origin/main}" >/dev/null 2>&1 && \
            git -C "$wt_path" reset --hard "${prior:-origin/main}" >/dev/null 2>&1 && \
-           git -C "$wt_path" clean -fd >/dev/null 2>&1 && rm -rf "$wt_path/.artifacts" ); then
+           git -C "$wt_path" clean -fd >/dev/null 2>&1 && stash_artifacts "$wt_path" "${old_branch:-$(basename "$wt_path")}" ); then
       echo "[$AGENT_NAME] slot reset failed for $wt_path, cutting a new one" >&2
       del_worktree "$root"  # release the reservation; the slot did not get reset
       wt_path=""
@@ -1148,9 +1163,10 @@ cleanup_worktree() {
         # be reclaimed.
         git -C "$wt_path" reset --hard origin/main >/dev/null 2>&1 || true
         git -C "$wt_path" clean -fd >/dev/null 2>&1 || true
-        rm -rf "$wt_path/.artifacts"
+        stash_artifacts "$wt_path" "${actual:-$branch}" || true
         ;;
       *)
+        stash_artifacts "$wt_path" "${actual:-$branch}" || true
         ( cd "$AGENT_REPO" && git worktree remove "$wt_path" --force >/dev/null 2>&1 )
         ;;
     esac
