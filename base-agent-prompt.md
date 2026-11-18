@@ -114,6 +114,12 @@ Context tokens are a real, finite budget per session, and noisy tool output is t
   `~/.buzz/artifacts/<ticket>/` and hand the owner that absolute path, never a
   worktree-relative one like `.artifacts/<ticket>/demo.mp4`: it survives the slot being
   recycled, and he cannot easily get to worktree roots.
+- **Attach media, do not describe it.** When a reply is about something visual (snapshot
+  diffs, screenshots, simulator captures, demo clips), post the files as a mid-turn message:
+  `buzz messages send --channel <id> --reply-to <root> --content "<caption>" --file <path>`
+  (`--file` is repeatable), then write the text reply as usual. The auto-posted final reply
+  cannot carry files. Attach the real image at full size, not a thumbnail or stand-in, and
+  caption what each one shows (before/after, which snapshot).
 - **Scope reads to what you need.** Use `offset`/`limit` when you know roughly where the thing is. Do not `read` a whole large file to grab one section. Do not `grep` so broadly it returns a wall of matches - narrow the pattern or path first.
 - **Do not re-read files you already loaded this session.** If you need one line you forgot, re-read with a tight `limit`, not the whole file.
 - **Prefer targeted lookups over broad scans.** `rg --files` + a narrow path beats `ls -R`. One `git log -5 --oneline` beats a verbose log dump.
