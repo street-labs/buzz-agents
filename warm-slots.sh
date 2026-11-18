@@ -29,6 +29,21 @@ LOCK="$HOME/.buzz/agents/.warm.lock"
 
 log() { echo "[$AGENT_NAME warm] $*"; }
 
+# A slot's .artifacts/ belongs to the thread that just left it, but a demo there may
+# not be attached or shared yet. Move it to ~/.buzz/artifacts/<label>/ instead of
+# deleting it, and prune anything there older than 7 days. Fails (and keeps the
+# original) if the copy fails, so a recycle never loses the only copy.
+stash_artifacts() {  # $1 = worktree, $2 = label (branch or slot name)
+  local src="$1/.artifacts" root="$HOME/.buzz/artifacts" dest
+  dest="$root/$(printf '%s' "$2" | tr '/ ' '--')"
+  if [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+    mkdir -p "$dest" && cp -Rp "$src/." "$dest/" && touch "$dest" || return 1
+  fi
+  rm -rf "$src"
+  find "$root" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
 # One warm at a time across every agent. These builds are heavy enough that two at
 # once make the machine slower for the live agents, which defeats the purpose.
 exec 9>"$LOCK"
@@ -77,7 +92,7 @@ for slot in "$base_dir/$AGENT_NAME-slot-"*; do
     [ "$(cat "$marker" 2>/dev/null)" = "$head_sha" ] && continue
 
     log "warming $slot at ${head_sha:0:8}"
-    if ! ( cd "$slot" && git checkout -q --detach "$head_sha" && git reset -q --hard "$head_sha" && git clean -qfd && rm -rf .artifacts ); then
+    if ! ( cd "$slot" && git checkout -q --detach "$head_sha" && git reset -q --hard "$head_sha" && git clean -qfd && stash_artifacts "$slot" "$(basename "$slot")" ); then
         log "could not reset $slot, skipping"
         continue
     fi

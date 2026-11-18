@@ -57,7 +57,8 @@ mkdir -p "$WT/builder-slot-0/.artifacts/sr1"; echo png > "$WT/builder-slot-0/.ar
 WARM_FORCE=1 sh "$WARM" builder >/dev/null 2>&1
 ran "$WT/builder-slot-0" || fail "did not rewarm after main moved"
 [ -e "$WT/builder-slot-0/.artifacts" ] && fail "left the previous thread's .artifacts in the slot"
-echo "ok: rewarms once main moves, and drops .artifacts"
+[ "$(cat "$HOME/.buzz/artifacts/builder-slot-0/sr1/shot.png" 2>/dev/null)" = png ] || fail "deleted .artifacts instead of stashing it"
+echo "ok: rewarms once main moves, and stashes .artifacts"
 
 # a dirty slot is never reset out from under anyone
 : > "$WARM_RAN_LOG"
