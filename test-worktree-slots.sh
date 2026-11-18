@@ -27,7 +27,7 @@ set_worktree() {
 }
 # functions under test, extracted verbatim
 eval "$(sed -n '/^archive_slot() {/,/^}/p;/^resurrect_branch() {/,/^}/p;/^SLOT_STALE_DAYS=/p;/^slot_is_stale() {/,/^}/p;/^reserve_slot() {/,/^}/p;/^claim_new_slot() {/,/^}/p;/^del_worktree() {/,/^}/p;/^claim_free_slot() {/,/^}/p' "$WATCHER")"
-eval "$(sed -n '/^repo_git_locked() {/,/^}/p;/^add_worktree() {/,/^}/p;/^create_worktree() {/,/^}/p' "$WATCHER")"
+eval "$(sed -n '/^repo_git_locked() {/,/^}/p;/^add_worktree() {/,/^}/p;/^create_worktree() {/,/^}/p;/^stash_artifacts() {/,/^}/p' "$WATCHER")"
 
 fail() { echo "FAIL: $1"; exit 1; }
 
