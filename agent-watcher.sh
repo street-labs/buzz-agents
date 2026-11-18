@@ -2098,6 +2098,24 @@ spawn_worker() {
   [ -n "${_slot_lock:-}" ] && rm -rf "$_slot_lock"
 }
 
+# A summon that links a thread (buzz://message?...&thread=<root>, or id=<root> with no
+# thread) is about that thread, but it is its own root in the channel it was posted
+# in, so the per-root lock never saw it: a link posted in #general while the linked
+# thread's turn was live started a second session that raced the first. Prints the
+# first linked root (other than $2, the message's own) that has a live worker.
+linked_busy_root() {  # $1=message content $2=own root
+  local link r
+  for link in $(printf '%s' "$1" | grep -oE 'buzz://message\?[^[:space:]<>()]+'); do
+    r="$(printf '%s' "$link" | grep -oE '[?&;]thread=[0-9a-f]+' | head -1 | cut -d= -f2)"
+    [ -n "$r" ] || r="$(printf '%s' "$link" | grep -oE '[?&;]id=[0-9a-f]+' | head -1 | cut -d= -f2)"
+    [ -n "$r" ] && [ "$r" != "$2" ] || continue
+    if [ -f "$WORKERS/root-$r.pid" ] && kill -0 "$(cat "$WORKERS/root-$r.pid" 2>/dev/null)" 2>/dev/null; then
+      echo "$r"; return 0
+    fi
+  done
+  return 1
+}
+
 # Reap finished workers and enforce max concurrency.
 # Counts root-*.pid only: each live worker writes TWO pid files (<msg_id>.pid and
 # root-<root_id>.pid), so globbing *.pid double-counted and halved MAX_WORKERS.
@@ -2348,6 +2366,7 @@ done
 write_channel_map
 prune_worktrees
 last_prune=$(date +%s)
+link_waits=" "   # summons queued behind a linked thread, logged once each
 echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} workers=0/$MAX_WORKERS channels=$(list_channel_ids | tr '\n' ' ')"
 
 while true; do
@@ -2413,6 +2432,14 @@ while true; do
       case "$spawned_roots" in *" $root_id "*) continue ;; esac
       rootpid="$WORKERS/root-$root_id.pid"
       if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+      # Queue a summon that links a thread with a live turn: left unseen, it is
+      # retried each poll and runs once that turn ends. Logged once per message.
+      if busy_link="$(linked_busy_root "$(printf '%s' "$b64" | base64 -d 2>/dev/null)" "$root_id")"; then
+        case "$link_waits" in *" $id "*) ;; *)
+          echo "[$AGENT_NAME] $id links thread $busy_link, which has a live turn - queued behind it"
+          link_waits="$link_waits$id " ;; esac
+        continue
+      fi
 
       # Wait if at capacity
       while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do
