@@ -180,6 +180,21 @@ agent's context; the message carries the path.
 `test-agent-jobs.sh` covers both outcomes, the no-double-report rule, and that a
 running job is left alone.
 
+## Relay backup
+
+`relay-backup.sh` dumps the relay's Postgres (`pg_dump -Fc`) and tars its MinIO volume,
+with `SHA256SUMS`, into `$BACKUP_DEST/<YYYY-MM-DD>/`, keeping the newest `KEEP_DAYS`
+(default 7). It writes under a dot-prefixed temp name and renames when complete, so a
+synced folder (OneDrive, Dropbox) never uploads half a dump. Secrets are not copied.
+Any failure posts to `ALERT_CHANNEL` with the key in `ALERT_KEY_FILE`, falling back to a
+macOS notification, and exits non-zero. Run it nightly from launchd or cron; `--dry-run`
+writes nothing. Restore with `pg_restore -d <db> buzz.dump` and untar into the volume.
+`test-relay-backup.sh` covers it with stubbed docker.
+
+On macOS, give the launchd job `BUZZ_RELAY_URL` in its plist, and make its first run a
+`launchctl kickstart`: a launchd job can only read and prune folders under
+`~/Library/CloudStorage` that it created itself.
+
 ## Usage limits
 
 Claude Code does not error when a usage limit is reached. It returns the notice as the
