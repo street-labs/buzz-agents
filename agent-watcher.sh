@@ -154,6 +154,7 @@ SALON_CONF_MIN="${SALON_CONF_MIN:-0.8}"
 # knobs (2026-09-19: arbiter tapped nobody at default 0.8 while env said 0.55).
 SALON_AGENT_CONF_MIN="${SALON_AGENT_CONF_MIN:-0.9}"   # higher bar when the trigger is an agent
 SALON_AGENT_TURN_CAP="${SALON_AGENT_TURN_CAP:-3}"      # consecutive agent turns before a human is required
+export AGENT_TURN_CAP_RELAYS="${AGENT_TURN_CAP_RELAYS:-}"  # roster names of relay bots, read by FILTER
 export SALON_SPEAK_MIN SALON_CONF_MIN SALON_AGENT_CONF_MIN
 SALON_TAP_PREFIX="${SALON_TAP_PREFIX:-[salon tap]}"
 SALON_ARBITER_SCRIPT="${SALON_ARBITER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/salon-arbiter.py}"
@@ -290,7 +291,7 @@ You are the \"$AGENT_NAME\" agent. Other agents share these same channels and th
 # were pulled into, only the thread OWNER keeps it going; guests defer. Output adds a
 # trailing `directly` flag. (Kept identical to the sequential agent-watcher.sh.)
 FILTER='
-import sys, json, base64
+import sys, os, json, base64
 seen = set(open(sys.argv[1]).read().split())
 owner = sys.argv[2]
 name = sys.argv[3].lower()
@@ -319,10 +320,15 @@ except:
     assist = set()
 follow_peer_threads = (len(sys.argv) > 9 and sys.argv[9] == "1")
 # Loop cap input: roster = agent pubkeys only (peers can include humans).
-agents = set()
+agents = set(); relays = set()
 try:
     if len(sys.argv) > 10 and sys.argv[10]:
-        agents = {l.split("\t")[0] for l in open(sys.argv[10]) if l.strip()}
+        roster = [l.rstrip("\n").split("\t") for l in open(sys.argv[10]) if l.strip()]
+        agents = {r[0] for r in roster}
+        # Relay bots (AGENT_TURN_CAP_RELAYS, roster names) post GitHub/Jira events, not
+        # agent turns: they never count toward the cap and they end a chain like a human.
+        relay_names = set(os.environ.get("AGENT_TURN_CAP_RELAYS", "").lower().split())
+        relays = {r[0] for r in roster if len(r) > 1 and r[1].lower() in relay_names}
 except:
     agents = set()
 try:
@@ -412,15 +418,18 @@ for m in msgs:
                 continue
     # Consecutive agent turns in this thread since the last human message, this one
     # included. A run of posts by one agent (progress updates, then the reply) is one
-    # turn. Owner messages and our own job posts are never capped.
+    # turn. Owner messages, relay posts and our own job posts are never capped, and a
+    # human post after this message releases it (the watcher leaves capped ones unseen).
     turns = 0
-    if pub != owner and not job_post and agents:
+    if pub != owner and pub not in relays and not job_post and agents:
         thread = sorted((x for x in msgs if find_root(x)[0] == root_id), key=lambda x: x.get("created_at", 0))
         ids = [x.get("id") for x in thread]
+        at = ids.index(mid) + 1 if mid in ids else len(thread)
+        released = any(x.get("pubkey", "") not in agents and x.get("pubkey", "") != me for x in thread[at:])
         last = None
-        for x in reversed(thread[:ids.index(mid) + 1] if mid in ids else thread):
+        for x in ([] if released else reversed(thread[:at])):
             xp = x.get("pubkey", "")
-            if xp not in agents and xp != me:
+            if (xp not in agents and xp != me) or xp in relays:
                 break
             if xp != last:
                 turns += 1; last = xp
@@ -2383,6 +2392,7 @@ write_channel_map
 prune_worktrees
 last_prune=$(date +%s)
 link_waits=" "   # summons queued behind a linked thread, logged once each
+cap_waits=" "    # summons held by the turn cap, logged once each
 echo "[$AGENT_NAME] up. model=$AGENT_MODEL repo=$AGENT_REPO pub=${BOT_PUB:0:12} workers=0/$MAX_WORKERS channels=$(list_channel_ids | tr '\n' ' ')"
 
 while true; do
@@ -2425,14 +2435,6 @@ while true; do
     while IFS=$'\t' read -r id b64 root_id threaded directly agent_turns; do
       [ -z "$id" ] && continue
 
-      # Loop cap: a peer summon after AGENT_TURN_CAP consecutive agent turns waits for
-      # a human. Same cap as the salon path; marked seen so it is not re-logged.
-      if [ "${agent_turns:-0}" -gt "${AGENT_TURN_CAP:-$SALON_AGENT_TURN_CAP}" ]; then
-        echo "[$AGENT_NAME] turn cap ($agent_turns agent turns) - skipped $id, waiting for a human in $root_id"
-        ( flock 200; echo "$id" >> "$SEEN" ) 200>"$SEEN.lock"
-        continue
-      fi
-
       # Skip if already being worked on
       [ -f "$WORKERS/$id.pid" ] && continue
 
@@ -2441,6 +2443,15 @@ while true; do
         flock 200
         grep -qxF "$id" "$SEEN" 2>/dev/null && exit 0 || exit 1
       ) 200>"$SEEN.lock" && continue
+
+      # Loop cap: a peer summon after AGENT_TURN_CAP consecutive agent turns waits for
+      # a human. Left unseen so the next human post releases it; logged once.
+      if [ "${agent_turns:-0}" -gt "${AGENT_TURN_CAP:-$SALON_AGENT_TURN_CAP}" ]; then
+        case "$cap_waits" in *" $id "*) ;; *)
+          echo "[$AGENT_NAME] turn cap ($agent_turns agent turns) - holding $id until a human posts in $root_id"
+          cap_waits="$cap_waits$id " ;; esac
+        continue
+      fi
 
       # Serialize per thread: messages in one thread share a single claude session,
       # and concurrent --resume corrupts it (empty replies). Only one worker per root

@@ -35,6 +35,24 @@ cap=3
 # No roster -> no cap (fail open, old behaviour).
 nr="$(printf '%s' "$msgs" | python3 -c "$FILTER" "$T/seen" "$OWNER" brain "$T/threads" "$T/peers" "$BRAIN" 0 "$T/assist" "" "" | cut -f1,6)"
 [ "$(turns "$nr" a4)" = 0 ] || { echo "FAIL: cap applied without a roster"; fail=1; }
+# Relay bot (prwatch) posts: never capped, and they end a chain like a human does.
+printf 'cccc\tprwatch\n' >> "$T/roster"; echo cccc >> "$T/peers"
+rmsgs="${msgs%]}"',
+ {"id":"r1","pubkey":"cccc","created_at":8,"content":"@brain CI failed","tags":['$r',["p","aaaa"]]},
+ {"id":"a5","pubkey":"bbbb","created_at":9,"content":"@brain P2","tags":['$r',["p","aaaa"]]}]'
+rr="$(printf '%s' "$rmsgs" | AGENT_TURN_CAP_RELAYS=prwatch python3 -c "$FILTER" "$T/seen" "$OWNER" brain "$T/threads" "$T/peers" "$BRAIN" 0 "$T/assist" "" "$T/roster" | cut -f1,6)"
+[ "$(turns "$rr" r1)" = 0 ] || { echo "FAIL: relay post counted toward the cap, got $(turns "$rr" r1)"; fail=1; }
+[ "$(turns "$rr" a5)" = 1 ] || { echo "FAIL: relay should end the chain, a5 got $(turns "$rr" a5)"; fail=1; }
+# A human post after a capped message releases it.
+hmsgs="${msgs%]}"', {"id":"h2","pubkey":"ffff","created_at":8,"content":"ok go","tags":['$r']}]'
+hr="$(printf '%s' "$hmsgs" | python3 -c "$FILTER" "$T/seen" "$OWNER" brain "$T/threads" "$T/peers" "$BRAIN" 0 "$T/assist" "" "$T/roster" | cut -f1,6)"
+[ "$(turns "$hr" a4)" = 0 ] || { echo "FAIL: human post did not release a4, got $(turns "$hr" a4)"; fail=1; }
+# Capped messages stay unseen (the cap gate must not write SEEN).
+python3 - <<'PY' || { echo "FAIL: cap gate marks the message seen"; fail=1; }
+import re; s = open("agent-watcher.sh").read()
+g = re.search(r'-gt "\$\{AGENT_TURN_CAP.*?continue', s, re.S).group(0)
+assert "SEEN" not in g
+PY
 grep -q 'agent_turns:-0}" -gt "${AGENT_TURN_CAP' agent-watcher.sh || { echo "FAIL: worker-path cap gate missing"; fail=1; }
 rm -rf "$T"
 [ "$fail" -eq 0 ] && echo "ok"
