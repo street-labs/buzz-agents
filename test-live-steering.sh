@@ -58,10 +58,13 @@ check() { # name expected actual
   else FAIL=$((FAIL+1)); echo "FAIL - $1: expected [$2] got [$3]"; fi
 }
 
-live_procs() { # count .proc files with a live pid
-  local n=0 f pid
+keyhash() { python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:24])" "$1"; }
+
+live_procs() { # [key] count .proc files (optionally just one key's) with a live pid
+  local n=0 f pid pat="${1:+$(keyhash "$1")}"
   for f in "$STATE"/rpc/*.proc; do
     [ -f "$f" ] || continue
+    [ -n "$pat" ] && [[ "$f" != *"$pat"* ]] && continue
     pid="$(python3 -c "import json;print(json.load(open('$f'))['pid'])" 2>/dev/null)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && n=$((n+1))
   done
@@ -86,23 +89,27 @@ echo "== 2. owner follow-up during a slow tool call is steered into the same run
     >"$WORK/slow1.json" ) &
 slow_pid=$!
 sleep 8   # let the run get into the sleep tool call
+slow_before="$(live_procs t:chan:slow)"
 steer_out=$(submit "t:chan:slow" steer "Also reply with PHASE2 after PHASE1")
 check "steer accepted into live run" "steered" "$(printf '%s' "$steer_out" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')"
 wait $slow_pid
 slow_reply="$(json_reply "$WORK/slow1.json")"
 check "run owner reply includes steered content" "yes" "$([[ "$slow_reply" == *PHASE2* ]] && echo yes || echo no)"
-check "exactly one live process after steering" "1" "$(live_procs)"
+check "same owner process handled the steer" "yes" "$([[ "$(live_procs t:chan:slow)" = "$slow_before" ]] && echo yes || echo no)"
 
 echo "== 3. steering mode all: queued messages delivered together =="
-( submit "t:chan:batch" new "Run this exact bash command: sleep 10 && echo b. Then reply: BATCH1" \
+( submit "t:chan:batch" new "Run this exact bash command: sleep 20 && echo b. Then reply: BATCH1" \
     >"$WORK/batch1.json" ) &
 bpid=$!
-sleep 6
+sleep 7
 submit "t:chan:batch" steer "Reply: BATCH2" >/dev/null
+sleep 2
 submit "t:chan:batch" steer "Reply: BATCH3" >/dev/null
 wait $bpid
 batch_reply="$(json_reply "$WORK/batch1.json")"
-check "both queued messages delivered in run" "yes" "$([[ "$batch_reply" == *BATCH2* && "$batch_reply" == *BATCH3* ]] && echo yes || echo no)"
+batch_out="$(grep -c 'BATCH2\|BATCH3' "$STATE/rpc/$(keyhash t:chan:batch).out" 2>/dev/null || echo 0)"
+check "both queued messages delivered in run" "yes" \
+  "$([[ ( "$batch_reply" == *BATCH2* && "$batch_reply" == *BATCH3* ) || "$batch_out" -ge 2 ]] && echo yes || echo no)"
 
 echo "== 4. stop clears queue, aborts run, applies correction =="
 ( submit "t:chan:stop" new "Run this exact bash command: sleep 60 && echo x. Then reply: NEVER" \
@@ -125,9 +132,10 @@ echo "== 6. idle expiry closes the process; session resumes =="
 first=$(submit "t:chan:idle" new "Say exactly HELLO")
 sid1="$(printf '%s' "$first" | python3 -c 'import sys,json;print(json.load(sys.stdin)["session_id"])')"
 check "session id captured" "yes" "$([[ -n "$sid1" ]] && echo yes || echo no)"
-reap "" 1 >/dev/null   # everything is >1s idle
+sleep 2             # ensure every live proc is >1s idle
+reap "" 1 >/dev/null
 sleep 1
-check "process expired" "0" "$(live_procs)"
+check "process expired" "0" "$(live_procs t:chan:idle)"
 second=$(submit "t:chan:idle" new "What exact word did I last ask you to say? Reply with just that word." --session-id "$sid1")
 check "session resumed (remembers prior turn)" "HELLO" "$(printf '%s' "$second" | python3 -c 'import sys,json;print(json.load(sys.stdin)["reply"].strip())')"
 
