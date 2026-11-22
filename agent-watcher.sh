@@ -164,6 +164,27 @@ is_salon_channel() {  # $1=channel id
 }
 AMBIENT_COUNT="${AMBIENT_COUNT:-8}"
 MAX_WORKERS="${MAX_WORKERS:-8}"  # max concurrent claude sessions
+
+# Live steering (setup/agents/STEERING.md): route active-thread follow-ups into a
+# live per-thread pi RPC owner instead of queueing a second one-shot turn. One
+# daemon holds one `pi --mode rpc` process per (agent, channel, root); owner
+# follow-ups steer, peer traffic follows up, explicit stop clears + aborts.
+# LIVE_STEERING=0 restores the one-shot path (rollback flag, kept for one release).
+LIVE_STEERING="${LIVE_STEERING:-0}"
+RPC_OWNER_SCRIPT="${RPC_OWNER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/pi_rpc_owner.py}"
+RPC_STATE="$STATE/rpc-owners"; mkdir -p "$RPC_STATE"
+
+# Stop any live RPC owner for a root (searches channels; used by /fresh, recycle,
+# worktree teardown - never leave a second process against a torn-down session).
+rpc_stop_owners_for_root() {  # $1=root_id
+  local d ch
+  for d in "$RPC_STATE"/owners/"$AGENT_NAME"/*/*"$1"; do
+    [ -d "$d" ] || continue
+    ch="${d#$RPC_STATE/owners/$AGENT_NAME/}"; ch="${ch%/*}"
+    python3 "$RPC_OWNER_SCRIPT" stop-owner --state-dir "$RPC_STATE" \
+      --agent "$AGENT_NAME" --channel "$ch" --root "$1" >/dev/null 2>&1 || true
+  done
+}
 BOOT_GRACE="${BOOT_GRACE_SECONDS:-600}"  # on boot, only suppress history OLDER than this; recent unanswered mentions survive a restart
 
 # The concurrent watcher serializes shared-state writes with flock, which macOS does
@@ -664,6 +685,10 @@ set_lastturn() {  # $1=root $2=ts
 # stays intact; durable state should already be on disk there.
 reset_thread_session() {  # $1=root
   local tmp_s tmp_l
+  # Stop the thread's live RPC owner first: a stale owner must never survive a
+  # session reset or /fresh teardown (STEERING.md routing rule 5).
+  [ "${LIVE_STEERING:-0}" = "1" ] && rpc_stop_owners_for_root "$1"
+  local tmp_s tmp_l
   tmp_s="$(mktemp)"; tmp_l="$(mktemp)"
   (
     flock 200
@@ -1143,6 +1168,7 @@ create_worktree() {
 # $1=root_id
 cleanup_worktree() {
   local root="$1" wt_path branch actual pr_state pr_state_actual
+  [ "${LIVE_STEERING:-0}" = "1" ] && rpc_stop_owners_for_root "$root"
   wt_path="$(get_worktree "$root")"
   branch="$(get_worktree_branch "$root")"
   [ -z "$wt_path" ] && return 0
@@ -1668,8 +1694,11 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   # liveness. ponytail: after the cap we proceed anyway rather than fail the turn -
   # a wedged lock must not cost the thread its answer; per-holder watchdog if that
   # ever actually bites.
+  # With live steering there is exactly one pi process per thread (the RPC owner),
+  # so the lock has nothing to protect - skip it on that path.
   SLOT_SESSION_WAIT="${SLOT_SESSION_WAIT:-600}"
   _slot_lock=""
+  if [ "${LIVE_STEERING:-0}" != "1" ] || [ "$AGENT_HARNESS" != "pi" ]; then
   case "$(basename "$work_dir")" in
     "$AGENT_NAME"-slot-*) _slot_lock="$work_dir/.buzz-session" ;;
   esac
@@ -1698,6 +1727,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
                || echo '.buzz-session' >> "$_gd/info/exclude"; }
       echo "[$AGENT_NAME worker-$$] session lock taken on $work_dir (root $root_id)"
     fi
+  fi   # live-steering lock bypass
   fi
 
   # Map canonical model name to harness-specific format. Compaction uses the same
@@ -1720,6 +1750,7 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   # and return without invoking the agent for a paid turn.
   if [ "${compact_mode:-0}" = "1" ]; then
     reply_target="$root_id"; [ -z "$reply_target" ] && reply_target="$msg_id"
+    [ "${LIVE_STEERING:-0}" = "1" ] && rpc_stop_owners_for_root "$root_id"
     "$BUZZ" reactions remove --event "$reply_target" --emoji '👀' >/dev/null 2>&1 || true
     if [ -z "$sid" ]; then
       compact_result=$'noop\t0\t0\tno harness session exists yet'
@@ -1781,9 +1812,58 @@ print(max(ts))" 2>/dev/null || echo 0)"
     mirror_pid=$!
   fi
 
-  # Run agent with timeout using harness adapter
-  invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
-  wait_with_timeout $!
+  # Live steering path (LIVE_STEERING=1, pi harness, thread turns): hand the turn
+  # to the thread's RPC owner. The daemon routes it as steer / followUp / stop into
+  # the live pi process; wait blocks until agent_settled with the steering queue
+  # drained. Falls back to the one-shot path if the owner daemon rejects delivery.
+  rpc_done=0
+  if [ "${LIVE_STEERING:-0}" = "1" ] && [ "$turn_harness" = "pi" ] && [ -n "$root_id" ]; then
+    rpc_routing="steer"
+    _rpc_pub="$(printf '%s' "$CURRENT_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("pubkey",""))' 2>/dev/null || true)"
+    _rpc_lc="$(printf '%s' "$content" | tr '[:upper:]' '[:lower:]')"
+    if printf '%s' "$_rpc_lc" | grep -qE '^ *(stop|cancel|abort|wrong|no, stop|no stop)\b'; then
+      rpc_routing="stop"
+    fi
+    [ "$rpc_routing" = "stop" ] || { [ "$_rpc_pub" = "$OWNER" ] || rpc_routing="followup"; }
+    rpc_provider="${harness_model%%/*}"; rpc_model="${harness_model#*/}"
+    rpc_out="$(mktemp)"; rpc_run="$(mktemp)"; rpc_err="$(mktemp)"
+    if python3 "$RPC_OWNER_SCRIPT" submit --state-dir "$RPC_STATE" --agent "$AGENT_NAME" \
+         --channel "$channel_id" --root "$root_id" --msg-id "$msg_id" \
+         --routing "$rpc_routing" --text "$prompt" --session-id "${turn_sid:-}" \
+         --work-dir "$work_dir" --provider "$rpc_provider" --model "$rpc_model" \
+         --timeout "$MODEL_TIMEOUT" >"$rpc_out" 2>"$rpc_err" \
+       && python3 "$RPC_OWNER_SCRIPT" wait --state-dir "$RPC_STATE" \
+         --agent "$AGENT_NAME" --channel "$channel_id" --root "$root_id" \
+         --timeout "$MODEL_TIMEOUT" >"$rpc_run"; then
+      # Synthesize a pi --mode json out_file so extraction, mirroring, and PPQ
+      # cost accounting downstream work unchanged.
+      RUNJSON="$(cat "$rpc_run")" OUTFILE="$out_file" python3 - <<'PY'
+import json, os
+run = json.loads(os.environ["RUNJSON"]).get("run") or {}
+with open(os.environ["OUTFILE"], "w") as f:
+    if run.get("session_id"):
+        f.write(json.dumps({"type": "session", "id": run["session_id"]}) + "\n")
+    for u in run.get("usage") or []:
+        f.write(json.dumps({"type": "turn_end", "message": u}) + "\n")
+text = run.get("text") or ""
+if not text:
+    text = "(no reply produced)"
+f.write(json.dumps({"type": "message_end", "message": {"role": "assistant",
+        "content": [{"type": "text", "text": text}]}}) + "\n")
+PY
+      rpc_done=1
+      echo "[$AGENT_NAME worker-$$] live-steer $rpc_routing $msg_id (root=$root_id)"
+    else
+      echo "[$AGENT_NAME worker-$$] rpc owner delivery failed for $msg_id: $(tail -1 "$rpc_err" 2>/dev/null) - one-shot fallback"
+    fi
+    rm -f "$rpc_out" "$rpc_run" "$rpc_err"
+  fi
+
+  if [ "$rpc_done" = 0 ]; then
+    # Run agent with timeout using harness adapter
+    invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
+    wait_with_timeout $!
+  fi
   if [ -n "$mirror_pid" ]; then
     kill "$mirror_pid" 2>/dev/null; wait "$mirror_pid" 2>/dev/null || true
   fi
@@ -1914,6 +1994,7 @@ PY
   if [ -z "$reply" ] && [ "${REPLY_GUARD:-1}" = "1" ] && [ "$watcher_action" != "mute" ] && [ "$directly" = "1" ]; then
     echo "[$AGENT_NAME worker-$$] empty reply on $msg_id - re-prompting once (reply guard)"
     local retry_out retry_sid eff_sid
+    [ "${LIVE_STEERING:-0}" = "1" ] && rpc_stop_owners_for_root "$root_id"
     eff_sid="${new_sid:-$sid}"; [ "$on_fallback" = 1 ] && eff_sid=""
     retry_out="$(mktemp)"
     invoke_harness "$turn_harness" "$retry_out" "Your previous turn completed without posting any reply. The user is still waiting. Post your response now with the buzz CLI per your instructions. If you are blocked, say so plainly." "$harness_model" "$eff_sid" "$work_dir" "$SYSTEM_PROMPT" &
@@ -2456,9 +2537,14 @@ while true; do
       # Serialize per thread: messages in one thread share a single claude session,
       # and concurrent --resume corrupts it (empty replies). Only one worker per root
       # at a time - both within this poll and across polls while one is still running.
-      case "$spawned_roots" in *" $root_id "*) continue ;; esac
-      rootpid="$WORKERS/root-$root_id.pid"
-      if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+      # Live steering lifts this: each message gets a worker, but they all deliver
+      # through the thread's single RPC owner (steer/followUp), never a second pi
+      # process on the same session.
+      if [ "${LIVE_STEERING:-0}" != "1" ]; then
+        case "$spawned_roots" in *" $root_id "*) continue ;; esac
+        rootpid="$WORKERS/root-$root_id.pid"
+        if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+      fi
       # Queue a summon that links a thread with a live turn: left unseen, it is
       # retried each poll and runs once that turn ends. Logged once per message.
       if busy_link="$(linked_busy_root "$(printf '%s' "$b64" | base64 -d 2>/dev/null)" "$root_id")"; then

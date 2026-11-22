@@ -129,6 +129,7 @@ class Owner:
 
     def _reader(self):
         current_text = []
+        current_usage = []
         for raw in self.proc.stdout:
             self.last_activity = time.time()
             try:
@@ -146,15 +147,26 @@ class Owner:
                         self.run_id = uuid.uuid4().hex[:12]
                         self.pending_ids = []
                         current_text = []
+                        current_usage = []
             elif rtype == "message_update":
                 evd = rec.get("assistantMessageEvent") or {}
                 if evd.get("type") == "text_delta":
                     current_text.append(evd.get("delta", ""))
+            elif rtype == "turn_end":
+                # Real cost accounting: pi json-mode cost extraction reads
+                # turn_end usage; accumulate the same here per run.
+                msg = rec.get("message") or {}
+                usage = msg.get("usage") or {}
+                if usage:
+                    current_usage.append({
+                        "model": msg.get("model", ""),
+                        "usage": usage,
+                    })
             elif rtype == "agent_settled":
                 # Wait for agent_settled, not agent_end: retries, compaction,
                 # and steering can follow agent_end.
                 with self.lock:
-                    run_id, pids = self.run_id, list(self.pending_ids)
+                    run_id, pids, usage = self.run_id, list(self.pending_ids), list(current_usage)
                     self.active = False
                     self.run_id = None
                     self.pending_ids = []
@@ -170,6 +182,7 @@ class Owner:
                     "aborted": bool(rec.get("aborted")),
                     "text": "".join(current_text),
                     "messages": pids,
+                    "usage": usage,
                     "session_id": sid,
                 }
                 if run_id:
