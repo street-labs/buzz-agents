@@ -130,6 +130,18 @@ AGENT_ASSIST_FILE="${AGENT_ASSIST_FILE:-$HOME/.buzz/agents/assist.txt}"
 AGENT_PEERS_FILE="${AGENT_PEERS_FILE:-$HOME/.buzz/agents/peers.txt}"
 MODEL_TIMEOUT="${MODEL_TIMEOUT:-600}"
 
+# Live steering (setup/agents/STEERING.md): one live `pi --mode rpc` process owns
+# an active thread. Owner follow-ups enter the run as steering messages instead of
+# starting a second one-shot invocation after the first answer already posted.
+# Opt-in per agent (AGENT_LIVE_STEERING=1 in the .env); pi harness only. Set to 0
+# to roll back to the one-shot path with no other change.
+AGENT_LIVE_STEERING="${AGENT_LIVE_STEERING:-0}"
+PI_RPC_OWNER="${PI_RPC_OWNER:-$(cd "$(dirname "$0")" && pwd)/pi_rpc_owner.py}"
+LIVE_STEER_SETTLE="${LIVE_STEER_SETTLE:-3}"      # secs of quiet after agent_settled before the closing post
+LIVE_STEER_COALESCE="${LIVE_STEER_COALESCE:-3}"  # max late owner messages folded into one closing post
+LIVE_STEER_MAX_IDLE="${LIVE_STEER_MAX_IDLE:-1800}" # idle expiry for live RPC processes
+LIVE_STEER_STOP_RE='^[[:space:]]*(stop|cancel|abort)[[:space:]]*[.!]?[[:space:]]*$|wrong, *stop'
+
 # Opt-in Jev triage (TypeSafe System One): drop high-confidence "ignore" noise
 # before spawning a worker. Off by default; any failure (no key, network error,
 # low confidence) = no verdict = behave exactly as today. See jev-triage.py.
@@ -1334,6 +1346,112 @@ wait_with_timeout() {  # $1=pid
   kill "$tpid" 2>/dev/null; wait "$tpid" 2>/dev/null
 }
 
+# Scan a channel message snapshot for owner messages newer than $2 that are not
+# yet claimed. Prints their ids, oldest first. $1=msgs-json $2=cur_ts
+late_owner_msgs() {
+  LATE_MSGS="$1" LATE_CUT="$2" LATE_SEEN="$SEEN" python3 -c '
+import os, json
+try: msgs = json.loads(os.environ["LATE_MSGS"])
+except Exception: msgs = []
+seen = set(open(os.environ["LATE_SEEN"]).read().split())
+cut = int(os.environ["LATE_CUT"])
+for m in msgs:
+    mid = m.get("id", "")
+    if mid and m.get("created_at", 0) > cut and mid not in seen:
+        print(mid)
+' 2>/dev/null
+}
+
+json_field() { # $1=json $2=field
+  printf '%s' "$1" | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('$2', ''))
+except Exception: print('')" 2>/dev/null
+}
+
+# Live steering: deliver one message through the thread's pi RPC owner.
+# $1=key $2=intent(steer|followup|stop|new) $3=prompt $4=model $5=sid $6=workdir
+# $7=system-prompt-file $8=run-timeout $9=msg-id  ->  prints the manager's JSON.
+live_steer_submit() {
+  python3 "$PI_RPC_OWNER" submit --state-dir "$STATE" --key "$1" --intent "$2" \
+    --message "$3" --model "$4" --session-id "$5" --workdir "$6" \
+    --system-prompt-file "$7" --run-timeout "$8" \
+    --settle "$LIVE_STEER_SETTLE" --msg-id "$9" 2>/dev/null
+}
+
+# Live-steering turn: deliver through the RPC owner, then coalesce any owner
+# follow-ups that landed while the run was active into the same closing post.
+# Sets reply/new_sid/cost_data like the one-shot path, or returns 2 when this
+# message was only queued into a run another worker owns.
+live_steer_turn() {
+  local steer_key="$1" intent="$2" prompt_text="$3" harness_model="$4" turn_sid="$5" \
+        work_dir="$6" sysfile="$7" msgs="$8" cur_ts="$9"
+  local res st reply_l sid_l cost_l attempt late_id late_content late_prompt
+
+  res="$(live_steer_submit "$steer_key" "$intent" "$prompt_text" "$harness_model" "$turn_sid" \
+            "$work_dir" "$sysfile" "$MODEL_TIMEOUT" "$msg_id")"
+  st="$(json_field "$res" status)"
+  case "$st" in
+    steered|queued|already_accepted)
+      echo "[$AGENT_NAME worker-$$] live-steer $st $msg_id (root=$root_id) - run owner posts the answer"
+      return 2 ;;
+  esac
+  if [ "$st" != "completed" ] && [ "$st" != "stop_applied" ] && [ "$st" != "timeout" ]; then
+    echo "[$AGENT_NAME worker-$$] live-steer manager error ($st): $(json_field "$res" error) - falling back to one-shot"
+    return 1
+  fi
+  if [ "$st" = "timeout" ]; then
+    # Hung run: abort it through the manager so idle expiry cannot extend it.
+    live_steer_submit "$steer_key" stop "" "$harness_model" "" "$work_dir" "$sysfile" 60 "" >/dev/null 2>&1
+    echo "[$AGENT_NAME worker-$$] live-steer run timeout on $msg_id - aborted"
+  fi
+  reply="$(json_field "$res" reply)"
+  new_sid="$(json_field "$res" session_id)"
+  cost_data="$(json_field "$res" cost)"
+  [ -n "$new_sid" ] && [ "$on_fallback" = 0 ] && set_session "$root_id" "$new_sid"
+
+  # Coalescing window: a follow-up that arrived while we ran should be answered
+  # in the same live session, not with a stale second post. Fold up to
+  # LIVE_STEER_COALESCE late owner messages in, then post one coherent answer.
+  for attempt in $(seq 1 "$LIVE_STEER_COALESCE"); do
+    late_id="$(late_owner_msgs "$msgs" "$cur_ts" | head -1)"
+    [ -z "$late_id" ] && break
+    late_content="$(get_msg_by_id "$late_id" "$msgs" | python3 -c '
+import sys, json
+try: print(json.load(sys.stdin).get("content", ""))
+except Exception: pass' 2>/dev/null)"
+    [ -z "$late_content" ] && break
+    (
+      flock 200
+      grep -qxF "$late_id" "$SEEN" 2>/dev/null || echo "$late_id" >> "$SEEN"
+    ) 200>"$SEEN.lock"
+    echo "[$AGENT_NAME worker-$$] coalescing late owner msg $late_id into run (root=$root_id)"
+    CURRENT_JSON="$(get_msg_by_id "$late_id" "$msgs")"
+    late_prompt="$(printf '%s\n%s\n%s\n' "[]" "[]" "$CURRENT_JSON" | python3 -c "$FORMAT_CONTEXT" "$OWNER" "$BOT_PUB" "$AGENT_NAME" "$AGENT_ROSTER_FILE" "$SINCE_TS")$POST_HINT"
+    res="$(live_steer_submit "$steer_key" steer "$late_prompt" "$harness_model" "${new_sid:-$turn_sid}" \
+              "$work_dir" "$sysfile" "$MODEL_TIMEOUT" "$late_id")"
+    st="$(json_field "$res" status)"
+    case "$st" in
+      completed|stop_applied|timeout)
+        [ -n "$(json_field "$res" reply)" ] && reply="$(json_field "$res" reply)"
+        [ -n "$(json_field "$res" session_id)" ] && { new_sid="$(json_field "$res" session_id)"; set_session "$root_id" "$new_sid"; }
+        cost_data="$(json_field "$res" cost)"
+        # Advance the watermark past this message so the loop terminates.
+        cur_ts="$(printf '%s' "$CURRENT_JSON" | python3 -c '
+import sys, json
+try: print(int(json.load(sys.stdin).get("created_at", 0)))
+except Exception: print(0)' 2>/dev/null)"
+        [ "$cur_ts" = "0" ] && break
+        ;;
+      steered|queued)
+        # A newer worker owns the run now; it posts the answer.
+        return 2 ;;
+      *)
+        break ;;
+    esac
+  done
+  return 0
+}
+
 worker() {
   local msg_id="$1" channel_id="$2" content="$3" root_id="$4" threaded="$5" directly="$6" msgs="$7"
 
@@ -1629,6 +1747,37 @@ print(max(ts))" 2>/dev/null || echo 0)"
 
   out_file="$(mktemp)"
 
+  # Live steering path (STEERING.md): deliver through the thread's RPC owner when
+  # enabled. Falls back to the one-shot invocation below on manager error or when
+  # disabled (rollback flag AGENT_LIVE_STEERING=0), and never for non-pi harnesses.
+  live_sysfile="$(mktemp)"
+  printf '%s' "$SYSTEM_PROMPT" > "$live_sysfile"
+  steer_key="$AGENT_NAME:$channel_id:$root_id"
+  [ -z "$root_id" ] && steer_key="$AGENT_NAME:$channel_id:$msg_id"
+  steer_intent="steer"; [ "$directly" = "1" ] || steer_intent="followup"
+  if printf '%s' "$content" | grep -qiE "$LIVE_STEER_STOP_RE"; then steer_intent="stop"; fi
+
+  if [ "$turn_harness" = "pi" ] && [ "${AGENT_LIVE_STEERING:-0}" = "1" ] && [ -f "$PI_RPC_OWNER" ]; then
+    live_steer_turn "$steer_key" "$steer_intent" "$prompt" "$harness_model" "$turn_sid" \
+      "$work_dir" "$live_sysfile" "$msgs" "${cur_ts:-0}"
+    lsrc=$?
+    if [ "$lsrc" = "2" ]; then
+      # Queued into a run another worker owns; that worker posts the single answer.
+      rm -f "$live_sysfile" "$out_file"
+      "$BUZZ" reactions remove --event "$reaction_target" --emoji '👀' >/dev/null 2>&1 || true
+      rm -f "$WORKERS/$msg_id.pid" "$WORKERS/root-$root_id.pid"
+      return 0
+    fi
+    if [ "$lsrc" = "0" ]; then
+      rm -f "$live_sysfile" "$out_file"
+    else
+      rm -f "$live_sysfile"   # manager error: fall through to one-shot below
+    fi
+  else
+    rm -f "$live_sysfile"
+  fi
+
+  if [ -f "$out_file" ]; then
   # Run agent with timeout using harness adapter
   invoke_harness "$turn_harness" "$out_file" "$prompt" "$harness_model" "$turn_sid" "$work_dir" "$SYSTEM_PROMPT" &
   wait_with_timeout $!
@@ -1637,6 +1786,7 @@ print(max(ts))" 2>/dev/null || echo 0)"
   reply="$(extract_harness_field "$turn_harness" "$out_file" result)"
   new_sid="$(extract_harness_field "$turn_harness" "$out_file" session_id)"
   cost_data="$(extract_harness_field "$turn_harness" "$out_file" cost)"
+  fi
 
   # The limit notice arrives as a normal-looking reply. Catch it before it is posted,
   # record the reset time, and re-run this turn on the fallback with the conversation
@@ -2215,6 +2365,13 @@ while true; do
     prune_worktrees
   fi
 
+  # Live steering housekeeping: expire idle RPC owners (process only - sessions
+  # stay on disk and resume) and enforce the live-process cap LRU.
+  if [ "${AGENT_LIVE_STEERING:-0}" = "1" ] && [ -f "$PI_RPC_OWNER" ]; then
+    python3 "$PI_RPC_OWNER" reap --state-dir "$STATE" \
+      --max-idle "$LIVE_STEER_MAX_IDLE" --max-live "$MAX_WORKERS" >/dev/null 2>&1 || true
+  fi
+
   # Wait if at max worker capacity
   while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do
     sleep 2
@@ -2249,12 +2406,16 @@ while true; do
         grep -qxF "$id" "$SEEN" 2>/dev/null && exit 0 || exit 1
       ) 200>"$SEEN.lock" && continue
 
-      # Serialize per thread: messages in one thread share a single claude session,
-      # and concurrent --resume corrupts it (empty replies). Only one worker per root
-      # at a time - both within this poll and across polls while one is still running.
-      case "$spawned_roots" in *" $root_id "*) continue ;; esac
-      rootpid="$WORKERS/root-$root_id.pid"
-      if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+      # Serialize per thread: messages in one thread share a single session, and
+      # concurrent --resume corrupts it (empty replies). With live steering the RPC
+      # owner serializes per (agent, channel, root) itself - a follow-up arriving
+      # during an active run is steered into that run instead of being deferred,
+      # so the root-pid skip only applies to the one-shot path.
+      if [ "${AGENT_LIVE_STEERING:-0}" != "1" ]; then
+        case "$spawned_roots" in *" $root_id "*) continue ;; esac
+        rootpid="$WORKERS/root-$root_id.pid"
+        if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
+      fi
 
       # Wait if at capacity
       while [ "$(active_worker_count)" -ge "$MAX_WORKERS" ]; do
