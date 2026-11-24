@@ -24,6 +24,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Author and committer emails are GitHub noreply
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git log --format='%ae%n%ce' "$BASE_SHA..$HEAD_SHA" | sort -u | sh hooks/email-allowlist
+
       - name: Scan PR title, body and commit messages
         env:
           DENYLIST: ${{ secrets.REDACT_DENYLIST }}

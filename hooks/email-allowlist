@@ -1,0 +1,16 @@
+#!/bin/sh
+# Reads author/committer emails on stdin, one per line, and fails if any is not a
+# GitHub noreply address. This repo is public: a work or personal email in a commit
+# header is published forever, and a later rewrite cannot reach refs/pull/*.
+#
+# Used by hooks/commit-msg (local) and .github/workflows/redact-check.yml (CI).
+ALLOW='^([0-9]+\+)?[A-Za-z0-9-]+@users\.noreply\.github\.com$|^noreply@github\.com$'
+bad=0
+while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    printf '%s\n' "$e" | grep -qE "$ALLOW" && continue
+    echo "email-allowlist: '$e' is not a GitHub noreply address." >&2
+    bad=1
+done
+[ "$bad" = 0 ] || echo "Fix it: git config user.email <id>+<login>@users.noreply.github.com" >&2
+exit $bad
