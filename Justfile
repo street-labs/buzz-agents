@@ -33,7 +33,7 @@ setup:
     echo ""
     echo "== Installing to ~/.buzz/agents =="
     mkdir -p ~/.buzz/agents
-    install -m 755 agent-watcher.sh harness-adapters.sh new-agent.sh warm-slots.sh agent-job.sh jev-triage.py jev-stall.py salon-arbiter.py ~/.buzz/agents/
+    install -m 755 agent-watcher.sh harness-adapters.sh new-agent.sh warm-slots.sh agent-job.sh jev-triage.py jev-stall.py salon-arbiter.py pi_rpc_owner.py ~/.buzz/agents/
     install -m 644 base-agent-prompt.md example.env ~/.buzz/agents/
     echo "  installed agent-watcher.sh, harness-adapters.sh, new-agent.sh, warm-slots.sh, agent-job.sh, jev-triage.py, base-agent-prompt.md, example.env"
     install -m 755 hooks/commit-msg .git/hooks/commit-msg

@@ -171,6 +171,11 @@ MAX_WORKERS="${MAX_WORKERS:-8}"  # max concurrent claude sessions
 # follow-ups steer, peer traffic follows up, explicit stop clears + aborts.
 # LIVE_STEERING=0 restores the one-shot path (rollback flag, kept for one release).
 LIVE_STEERING="${LIVE_STEERING:-0}"
+STEER_HARNESSES="pi claude codex"   # harnesses pi_rpc_owner.py has a backend for
+steers() {  # $1=harness: true when its turns go through the live RPC owner
+  [ "${LIVE_STEERING:-0}" = "1" ] && case " $STEER_HARNESSES " in *" $1 "*) return 0 ;; esac
+  return 1
+}
 RPC_OWNER_SCRIPT="${RPC_OWNER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/pi_rpc_owner.py}"
 RPC_STATE="$STATE/rpc-owners"; mkdir -p "$RPC_STATE"
 
@@ -1694,11 +1699,11 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
   # liveness. ponytail: after the cap we proceed anyway rather than fail the turn -
   # a wedged lock must not cost the thread its answer; per-holder watchdog if that
   # ever actually bites.
-  # With live steering there is exactly one pi process per thread (the RPC owner),
-  # so the lock has nothing to protect - skip it on that path.
+  # With live steering there is exactly one harness process per thread (the RPC
+  # owner), so the lock has nothing to protect - skip it on that path.
   SLOT_SESSION_WAIT="${SLOT_SESSION_WAIT:-600}"
   _slot_lock=""
-  if [ "${LIVE_STEERING:-0}" != "1" ] || [ "$AGENT_HARNESS" != "pi" ]; then
+  if ! steers "$AGENT_HARNESS"; then
   case "$(basename "$work_dir")" in
     "$AGENT_NAME"-slot-*) _slot_lock="$work_dir/.buzz-session" ;;
   esac
@@ -1812,12 +1817,12 @@ print(max(ts))" 2>/dev/null || echo 0)"
     mirror_pid=$!
   fi
 
-  # Live steering path (LIVE_STEERING=1, pi harness, thread turns): hand the turn
-  # to the thread's RPC owner. The daemon routes it as steer / followUp / stop into
-  # the live pi process; wait blocks until agent_settled with the steering queue
-  # drained. Falls back to the one-shot path if the owner daemon rejects delivery.
-  rpc_done=0
-  if [ "${LIVE_STEERING:-0}" = "1" ] && [ "$turn_harness" = "pi" ] && [ -n "$root_id" ]; then
+  # Live steering path (LIVE_STEERING=1, a harness in STEER_HARNESSES, thread turns):
+  # hand the turn to the thread's RPC owner. The daemon routes it as steer / followUp /
+  # stop into the live harness process; wait blocks until the run settles with the
+  # queue drained. Falls back to the one-shot path if the owner daemon rejects delivery.
+  rpc_done=0; rpc_dup=0
+  if steers "$turn_harness" && [ -n "$root_id" ]; then
     rpc_routing="steer"
     _rpc_pub="$(printf '%s' "$CURRENT_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("pubkey",""))' 2>/dev/null || true)"
     _rpc_lc="$(printf '%s' "$content" | tr '[:upper:]' '[:lower:]')"
@@ -1825,33 +1830,29 @@ print(max(ts))" 2>/dev/null || echo 0)"
       rpc_routing="stop"
     fi
     [ "$rpc_routing" = "stop" ] || { [ "$_rpc_pub" = "$OWNER" ] || rpc_routing="followup"; }
-    rpc_provider="${harness_model%%/*}"; rpc_model="${harness_model#*/}"
     rpc_out="$(mktemp)"; rpc_run="$(mktemp)"; rpc_err="$(mktemp)"
     if python3 "$RPC_OWNER_SCRIPT" submit --state-dir "$RPC_STATE" --agent "$AGENT_NAME" \
          --channel "$channel_id" --root "$root_id" --msg-id "$msg_id" \
          --routing "$rpc_routing" --text "$prompt" --session-id "${turn_sid:-}" \
-         --work-dir "$work_dir" --provider "$rpc_provider" --model "$rpc_model" \
+         --work-dir "$work_dir" --harness "$turn_harness" --model "$harness_model" \
+         --system-prompt "$SYSTEM_PROMPT" \
          --timeout "$MODEL_TIMEOUT" >"$rpc_out" 2>"$rpc_err" \
        && python3 "$RPC_OWNER_SCRIPT" wait --state-dir "$RPC_STATE" \
          --agent "$AGENT_NAME" --channel "$channel_id" --root "$root_id" \
          --timeout "$MODEL_TIMEOUT" >"$rpc_run"; then
-      # Synthesize a pi --mode json out_file so extraction, mirroring, and PPQ
-      # cost accounting downstream work unchanged.
+      # The owner hands back the harness's own one-shot output, so extraction,
+      # mirroring and cost accounting downstream work unchanged.
       RUNJSON="$(cat "$rpc_run")" OUTFILE="$out_file" python3 - <<'PY'
 import json, os
 run = json.loads(os.environ["RUNJSON"]).get("run") or {}
 with open(os.environ["OUTFILE"], "w") as f:
-    if run.get("session_id"):
-        f.write(json.dumps({"type": "session", "id": run["session_id"]}) + "\n")
-    for u in run.get("usage") or []:
-        f.write(json.dumps({"type": "turn_end", "message": u}) + "\n")
-text = run.get("text") or ""
-if not text:
-    text = "(no reply produced)"
-f.write(json.dumps({"type": "message_end", "message": {"role": "assistant",
-        "content": [{"type": "text", "text": text}]}}) + "\n")
+    f.write(run.get("out") or "")
+if run.get("last") is not None:
+    with open(os.environ["OUTFILE"] + ".last", "w") as f:
+        f.write(run["last"])
 PY
       rpc_done=1
+      grep -q '"duplicate": true' "$rpc_run" && rpc_dup=1
       echo "[$AGENT_NAME worker-$$] live-steer $rpc_routing $msg_id (root=$root_id)"
     else
       echo "[$AGENT_NAME worker-$$] rpc owner delivery failed for $msg_id: $(tail -1 "$rpc_err" 2>/dev/null) - one-shot fallback"
@@ -1866,6 +1867,15 @@ PY
   fi
   if [ -n "$mirror_pid" ]; then
     kill "$mirror_pid" 2>/dev/null; wait "$mirror_pid" 2>/dev/null || true
+  fi
+  # This message was steered into a run another worker already took: that worker
+  # posts the one combined reply.
+  if [ "$rpc_dup" = 1 ]; then
+    echo "[$AGENT_NAME worker-$$] $msg_id answered by the thread's shared run - not posting twice"
+    _dup_target="$root_id"; [ -z "$_dup_target" ] && _dup_target="$msg_id"
+    "$BUZZ" reactions remove --event "$_dup_target" --emoji '👀' >/dev/null 2>&1 || true
+    rm -f "$out_file" "$out_file.last" "$WORKERS/$msg_id.pid"
+    return 0
   fi
 
   # Extract result and session using harness-aware extraction
@@ -2540,7 +2550,7 @@ while true; do
       # Live steering lifts this: each message gets a worker, but they all deliver
       # through the thread's single RPC owner (steer/followUp), never a second pi
       # process on the same session.
-      if [ "${LIVE_STEERING:-0}" != "1" ]; then
+      if ! steers "$AGENT_HARNESS"; then
         case "$spawned_roots" in *" $root_id "*) continue ;; esac
         rootpid="$WORKERS/root-$root_id.pid"
         if [ -f "$rootpid" ] && kill -0 "$(cat "$rootpid" 2>/dev/null)" 2>/dev/null; then continue; fi
