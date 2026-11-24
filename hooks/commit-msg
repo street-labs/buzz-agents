@@ -8,6 +8,13 @@
 #
 # Installed by `just install`. CI runs the same check over PR titles and bodies.
 set -u
+
+# Author and committer must be GitHub noreply addresses (see hooks/email-allowlist).
+HOOKS="$(cd "$(dirname "$0")" && pwd)"
+for v in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+    git var "$v" | sed -n 's/.*<\(.*\)>.*/\1/p'
+done | sh "$HOOKS/email-allowlist" || exit 1
+
 LIST="${BUZZ_DENYLIST_FILE:-$HOME/.buzz/redact-denylist}"
 [ -f "$LIST" ] || exit 0
 

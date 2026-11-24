@@ -37,6 +37,7 @@ setup:
     install -m 644 base-agent-prompt.md example.env ~/.buzz/agents/
     echo "  installed agent-watcher.sh, harness-adapters.sh, new-agent.sh, warm-slots.sh, agent-job.sh, jev-triage.py, base-agent-prompt.md, example.env"
     install -m 755 hooks/commit-msg .git/hooks/commit-msg
+    install -m 755 hooks/email-allowlist .git/hooks/email-allowlist
     echo "  installed commit-msg hook (denylist: ${BUZZ_DENYLIST_FILE:-~/.buzz/redact-denylist})"
     echo ""
     echo "== Next steps =="

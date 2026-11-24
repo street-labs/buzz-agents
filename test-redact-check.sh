@@ -7,6 +7,7 @@ T=$(mktemp -d)
 export BUZZ_DENYLIST_FILE="$T/denylist"
 printf '%s\n' "# comment line" "" "acmecorp" "example\.com" > "$BUZZ_DENYLIST_FILE"
 fail() { echo "FAIL: $1"; exit 1; }
+export GIT_AUTHOR_EMAIL=7925830+someone@users.noreply.github.com GIT_COMMITTER_EMAIL=noreply@github.com
 
 printf 'Fix the widget cache\n' > "$T/ok.msg"
 sh "$HOOK" "$T/ok.msg" 2>/dev/null || fail "clean message was rejected"
@@ -24,6 +25,18 @@ printf 'A comment-only denylist must not match\n' > "$T/c.msg"
 printf '%s\n' "# acmecorp" > "$BUZZ_DENYLIST_FILE"
 sh "$HOOK" "$T/c.msg" 2>/dev/null || fail "commented-out pattern was applied"
 echo "ok: comments and blank lines ignored"
+
+ALLOW="$(dirname "$HOOK")/email-allowlist"
+printf '%s\n' 1+a-b@users.noreply.github.com someone@users.noreply.github.com noreply@github.com | sh "$ALLOW" 2>/dev/null \
+  || fail "noreply emails were rejected"
+echo "ok: noreply author/committer emails pass"
+for e in someone@example.com someone@users.noreply.github.com.evil.io x@noreply@github.com; do
+  printf '%s\n' noreply@github.com "$e" | sh "$ALLOW" 2>/dev/null && fail "non-noreply email accepted: $e"
+done
+echo "ok: other emails rejected"
+GIT_AUTHOR_EMAIL=someone@example.com sh "$HOOK" "$T/ok.msg" 2>/dev/null && fail "hook accepted a non-noreply author"
+GIT_COMMITTER_EMAIL=someone@example.com sh "$HOOK" "$T/ok.msg" 2>/dev/null && fail "hook accepted a non-noreply committer"
+echo "ok: commit-msg hook rejects non-noreply author and committer"
 
 # The CI step's scan, same logic over title + body + commit subjects.
 scan() {
