@@ -1664,18 +1664,18 @@ print(json.dumps({"id": sys.argv[1], "content": sys.stdin.read(), "pubkey": sys.
 
   if [ -n "$sid" ]; then
     # Resuming: run in the same dir the session was created in. direct-main agents
-    # never made a worktree, and a builder's worktree may have been cleaned up
-    # after its PR merged - fall back to the main repo so `pi --session` / `claude
-    # --resume` finds the session (an empty work_dir would run in the wrong project).
-    [ -z "$work_dir" ] && work_dir="$AGENT_REPO"
+    # never made a worktree, so they resume in the main repo. A branch-pr thread
+    # with no row lost its slot to a reclaim (or cleanup after a merge): never run
+    # it in $AGENT_REPO, the owner's own checkout - restore it below like a gone path.
+    [ -z "$work_dir" ] && [ "$AGENT_GUARDRAIL" = "direct-main" ] && work_dir="$AGENT_REPO"
     # The path can be gone while the row survives: an external reaper sweeps clean
     # worktrees, and a slot claimed by another thread is reset out from under this
     # one. cd into a missing dir kills the turn before the harness starts, so the
     # agent answers a follow-up with silence. Cut a replacement instead - the
     # session id does not depend on the path, so the resume still carries the
     # conversation, and create_worktree puts the thread back on its own branch.
-    if [ ! -d "$work_dir" ]; then
-      echo "[$AGENT_NAME worker-$$] worktree gone: $work_dir - cutting a replacement" >&2
+    if [ -z "$work_dir" ] || [ ! -d "$work_dir" ]; then
+      echo "[$AGENT_NAME worker-$$] worktree gone: ${work_dir:-<no row>} - cutting a replacement" >&2
       if [ "$AGENT_GUARDRAIL" = "direct-main" ]; then work_dir="$AGENT_REPO"; else work_dir="$(create_worktree "$root_id")" || { worktree_failed "$channel_id" "$root_id" "$msg_id"; return 0; }; fi
     fi
   else
