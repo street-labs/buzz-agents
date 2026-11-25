@@ -2088,26 +2088,34 @@ except Exception:
   # mentions ("use @-mention", "@mentions are parsed") therefore loses its entire
   # reply, and a p-tag to a non-member fails the same way. Both are recoverable:
   # neutralize the offending token with a zero-width space (visually identical,
-  # no longer parsed as a mention), drop unresolvable --mention flags, and resend
-  # once. Silently discarding a finished reply is the worst available outcome.
-  if [ "$send_rc" -ne 0 ] && printf '%s' "$send_out" | grep -q "does not match a current channel member\|are not channel members"; then
+  # no longer parsed as a mention), drop unresolvable --mention flags, and resend.
+  # The relay names one bad token per rejection and a reply can carry several, so
+  # loop until it sends or a rejection names nothing new to fix. Silently
+  # discarding a finished reply is the worst available outcome.
+  retry_reply="$reply"; dropped_flags=0; tries=0
+  while [ "$send_rc" -ne 0 ] && [ "$tries" -lt "${MENTION_RETRY_MAX:-8}" ] \
+      && printf '%s' "$send_out" | grep -q "does not match a current channel member\|are not channel members"; do
+    tries=$((tries + 1))
     bad_token="$(printf '%s' "$send_out" | sed -n "s/.*mention .\(@[^']*\). does not match.*/\1/p" | head -1)"
-    retry_reply="$reply"
-    if [ -n "$bad_token" ]; then
-      retry_reply="$(printf '%s' "$reply" | python3 -c '
+    if [ -n "$bad_token" ] && [[ "$retry_reply" == *"$bad_token"* ]]; then
+      fixed="$(printf '%s' "$retry_reply" | python3 -c '
 import sys
 token = sys.argv[1]
 body = sys.stdin.read()
 # U+200B after the @ keeps the text readable but stops mention parsing.
 print(body.replace(token, "@\u200b" + token[1:]), end="")
 ' "$bad_token" 2>/dev/null)"
-      [ -z "$retry_reply" ] && retry_reply="$reply"
+      [ -n "$fixed" ] && [ "$fixed" != "$retry_reply" ] || break
+      retry_reply="$fixed"
+    elif [ "$dropped_flags" = 1 ]; then
+      break  # nothing new to neutralize: give up and save the reply
     fi
+    dropped_flags=1
     echo "[$AGENT_NAME worker-$$] send rejected on mention ${bad_token:-<non-member p-tag>}, retrying without it"
     send_out="$("$BUZZ" messages send --channel "$channel_id" --reply-to "$reply_target" --content "$retry_reply" 2>&1)"
     send_rc=$?
-    [ "$send_rc" -eq 0 ] && reply="$retry_reply"
-  fi
+  done
+  [ "$send_rc" -eq 0 ] && reply="$retry_reply"
   if [ "$send_rc" -eq 0 ]; then
     # (msg_id was already marked seen at worker start, above.) Record our thread role
     # on first engagement: owner if we started it (engaged via the root message),
