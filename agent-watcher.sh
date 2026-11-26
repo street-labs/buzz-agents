@@ -177,7 +177,6 @@ steers() {  # $1=harness: true when its turns go through the live RPC owner
   return 1
 }
 RPC_OWNER_SCRIPT="${RPC_OWNER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/pi_rpc_owner.py}"
-RPC_STATE="$STATE/rpc-owners"; mkdir -p "$RPC_STATE"
 
 # Stop any live RPC owner for a root (searches channels; used by /fresh, recycle,
 # worktree teardown - never leave a second process against a torn-down session).
@@ -213,6 +212,7 @@ export OWNER="${OWNER:?Set OWNER to the human owner hex pubkey (nak key public <
 BOT_PUB="$(nak key public "$(cat "$AGENT_KEY_FILE")" 2>/dev/null)"
 
 STATE="$HOME/.buzz/agents/$AGENT_NAME"; mkdir -p "$STATE"
+RPC_STATE="$STATE/rpc-owners"; mkdir -p "$RPC_STATE"
 
 # Second singleton guard (macOS flock(1) does not enforce fd locks, so this is
 # the effective one): anchor the mkdir mutex to the FIXED state dir, not
